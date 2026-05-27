@@ -1,0 +1,42 @@
+[broker]
+provider = "alpaca"
+mode = "paper"
+
+[agent]
+cycle_seconds = 300
+run_on_weekends_for_crypto = true
+execute_orders = true
+max_orders_per_cycle = 3
+
+[audit]
+enabled = true
+database_path = "data/trading_agent.sqlite3"
+
+[risk]
+max_risk_per_trade_pct = 2.0
+max_daily_loss_pct = 3.0
+max_position_pct = 12.0
+max_crypto_position_pct = 10.0
+max_options_premium_pct = 2.0
+min_cash_buffer_pct = 5.0
+
+[strategy]
+symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "BTC/USD", "ETH/USD"]
+enabled = [
+  "equity_momentum",
+  "crypto_momentum",
+  "covered_call",
+  "cash_secured_put",
+  "long_call",
+  "long_put",
+  "call_debit_spread",
+  "put_debit_spread"
+]
+allow_options = false
+allow_crypto = false
+allow_short = false
+min_signal_score = 70.0
+
+[research]
+news_headline_limit = 8
+sec_companyfacts_enabled = true

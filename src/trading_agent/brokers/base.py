@@ -1,0 +1,19 @@
+from __future__ import annotations
+
+from typing import Protocol
+
+from trading_agent.models import AccountSnapshot, MarketSnapshot, OrderIntent, Position
+
+
+class Broker(Protocol):
+    async def get_account(self) -> AccountSnapshot: ...
+
+    async def get_positions(self) -> list[Position]: ...
+
+    async def get_market_snapshot(self, symbol: str) -> MarketSnapshot: ...
+
+    async def submit_order(self, intent: OrderIntent) -> dict: ...
+
+    async def get_open_orders(self) -> list[dict]: ...
+
+    async def cancel_all_orders(self) -> list[dict]: ...
