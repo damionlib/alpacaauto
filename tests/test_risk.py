@@ -167,3 +167,35 @@ def test_debit_spread_approval_builds_mleg_order() -> None:
     assert decision.intent is not None
     assert decision.intent.order_class == "mleg"
     assert decision.intent.limit_price == 3.10
+
+
+def test_exit_candidate_uses_existing_position_quantity() -> None:
+    settings = Settings()
+    engine = RiskEngine(settings)
+    decision = engine.evaluate(
+        TradeCandidate(
+            symbol="AAPL",
+            asset_class=AssetClass.EQUITY,
+            side=OrderSide.SELL,
+            strategy="stop_loss_exit",
+            score=100,
+            entry_price=93,
+            metadata={"exit": True, "exit_qty": 25},
+        ),
+        AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000, last_equity=100_000),
+        [
+            Position(
+                symbol="AAPL",
+                asset_class=AssetClass.EQUITY,
+                qty=10,
+                market_value=930,
+                avg_entry_price=100,
+            )
+        ],
+    )
+
+    assert decision.approved
+    assert decision.intent is not None
+    assert decision.intent.side == OrderSide.SELL
+    assert decision.intent.qty == 10
+    assert decision.reason == "Approved position exit."

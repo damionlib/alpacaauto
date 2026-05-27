@@ -26,6 +26,9 @@ class RiskEngine:
         account: AccountSnapshot,
         positions: list[Position],
     ) -> RiskDecision:
+        if candidate.metadata.get("exit"):
+            return self._evaluate_exit(candidate, positions)
+
         if account.daily_pl_pct <= -self.settings.risk.max_daily_loss_pct:
             return self._reject(candidate, f"Daily loss stop reached: {account.daily_pl_pct:.2f}%.")
 
@@ -40,6 +43,42 @@ class RiskEngine:
         if candidate.asset_class == AssetClass.OPTION:
             return self._evaluate_option(candidate, account, positions, available_cash)
         return self._reject(candidate, f"Unsupported asset class: {candidate.asset_class}.")
+
+    def _evaluate_exit(
+        self,
+        candidate: TradeCandidate,
+        positions: list[Position],
+    ) -> RiskDecision:
+        position = self._position(candidate.symbol, positions)
+        if not position:
+            return self._reject(candidate, "No existing position found to close.")
+        requested_qty = float(candidate.metadata.get("exit_qty") or abs(position.qty))
+        close_qty = min(abs(position.qty), requested_qty)
+        if close_qty <= 0:
+            return self._reject(candidate, "Calculated close quantity is zero.")
+
+        if position.qty > 0 and candidate.side != OrderSide.SELL:
+            return self._reject(candidate, "Long positions must be closed with a sell order.")
+        if position.qty < 0 and candidate.side != OrderSide.BUY:
+            return self._reject(candidate, "Short positions must be closed with a buy order.")
+
+        qty = close_qty
+        if candidate.asset_class in {AssetClass.EQUITY, AssetClass.ETF, AssetClass.OPTION}:
+            qty = int(close_qty)
+            if qty < 1:
+                return self._reject(candidate, "Calculated close quantity is below 1.")
+
+        intent = OrderIntent(
+            symbol=candidate.symbol,
+            asset_class=candidate.asset_class,
+            side=candidate.side,
+            qty=qty,
+            order_type=OrderType.MARKET,
+            time_in_force=TimeInForce.GTC if candidate.asset_class == AssetClass.CRYPTO else TimeInForce.DAY,
+            client_order_id=self._client_order_id(candidate),
+            metadata=candidate.metadata,
+        )
+        return RiskDecision(approved=True, reason="Approved position exit.", intent=intent, candidate=candidate)
 
     def _evaluate_spot(
         self,
@@ -178,6 +217,12 @@ class RiskEngine:
             if position.symbol == symbol:
                 return abs(position.market_value)
         return 0.0
+
+    def _position(self, symbol: str, positions: list[Position]) -> Position | None:
+        for position in positions:
+            if position.symbol == symbol:
+                return position
+        return None
 
     def _position_qty(self, symbol: str, positions: list[Position]) -> float:
         for position in positions:

@@ -63,3 +63,31 @@ def test_audit_backup_and_export_preserve_data(tmp_path) -> None:
     backup_store = AuditStore(backup_path)
     assert backup_store.counts()["cycles"] == 1
     assert export_path.read_text(encoding="utf-8").count("cycles") >= 1
+
+
+def test_position_state_tracks_peak_and_trough(tmp_path) -> None:
+    store = AuditStore(tmp_path / "audit.sqlite3")
+
+    first = store.update_position_state(symbol="AAPL", asset_class="equity", current_price=100)
+    second = store.update_position_state(symbol="AAPL", asset_class="equity", current_price=110)
+    third = store.update_position_state(symbol="AAPL", asset_class="equity", current_price=95)
+
+    assert first["peak_price"] == 100
+    assert second["peak_price"] == 110
+    assert third["peak_price"] == 110
+    assert third["trough_price"] == 95
+
+
+def test_reconcile_position_states_removes_closed_symbols(tmp_path) -> None:
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    store.update_position_state(symbol="AAPL", asset_class="equity", current_price=100)
+    store.update_position_state(symbol="MSFT", asset_class="equity", current_price=200)
+
+    store.reconcile_position_states({"AAPL"})
+
+    with store._connect() as connection:
+        symbols = [
+            row["symbol"]
+            for row in connection.execute("select symbol from position_state order by symbol").fetchall()
+        ]
+    assert symbols == ["AAPL"]

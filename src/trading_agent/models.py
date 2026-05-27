@@ -36,6 +36,7 @@ class Position(BaseModel):
     qty: float
     market_value: float
     avg_entry_price: float | None = None
+    current_price: float | None = None
     unrealized_pl: float | None = None
 
 

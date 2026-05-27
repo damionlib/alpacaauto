@@ -66,6 +66,15 @@ class AuditStore:
                     foreign key(cycle_id) references cycles(id)
                 );
 
+                create table if not exists position_state (
+                    symbol text primary key,
+                    asset_class text not null,
+                    first_seen_at text not null,
+                    last_seen_at text not null,
+                    peak_price real,
+                    trough_price real
+                );
+
                 create index if not exists idx_audit_events_cycle_id on audit_events(cycle_id);
                 create index if not exists idx_audit_events_type on audit_events(event_type);
                 create index if not exists idx_audit_events_created_at on audit_events(created_at);
@@ -219,6 +228,63 @@ class AuditStore:
             cycles = connection.execute("select count(*) from cycles").fetchone()[0]
             events = connection.execute("select count(*) from audit_events").fetchone()[0]
         return {"cycles": int(cycles), "events": int(events)}
+
+    def update_position_state(
+        self,
+        *,
+        symbol: str,
+        asset_class: str,
+        current_price: float,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self._connect() as connection:
+            row = connection.execute(
+                "select * from position_state where symbol = ?",
+                (symbol,),
+            ).fetchone()
+            if row:
+                peak_price = max(float(row["peak_price"] or current_price), current_price)
+                trough_price = min(float(row["trough_price"] or current_price), current_price)
+                connection.execute(
+                    """
+                    update position_state
+                    set asset_class = ?, last_seen_at = ?, peak_price = ?, trough_price = ?
+                    where symbol = ?
+                    """,
+                    (asset_class, now, peak_price, trough_price, symbol),
+                )
+                first_seen_at = row["first_seen_at"]
+            else:
+                first_seen_at = now
+                peak_price = current_price
+                trough_price = current_price
+                connection.execute(
+                    """
+                    insert into position_state
+                        (symbol, asset_class, first_seen_at, last_seen_at, peak_price, trough_price)
+                    values (?, ?, ?, ?, ?, ?)
+                    """,
+                    (symbol, asset_class, first_seen_at, now, peak_price, trough_price),
+                )
+        return {
+            "symbol": symbol,
+            "asset_class": asset_class,
+            "first_seen_at": first_seen_at,
+            "last_seen_at": now,
+            "peak_price": peak_price,
+            "trough_price": trough_price,
+        }
+
+    def reconcile_position_states(self, active_symbols: set[str]) -> None:
+        with self._connect() as connection:
+            if not active_symbols:
+                connection.execute("delete from position_state")
+                return
+            placeholders = ",".join("?" for _ in active_symbols)
+            connection.execute(
+                f"delete from position_state where symbol not in ({placeholders})",
+                tuple(active_symbols),
+            )
 
     def _dumps(self, value: Any) -> str:
         return json.dumps(to_jsonable(value), sort_keys=True, default=str)

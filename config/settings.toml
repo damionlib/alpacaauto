@@ -12,6 +12,16 @@ max_orders_per_cycle = 3
 enabled = true
 database_path = "data/trading_agent.sqlite3"
 
+[position_manager]
+enabled = true
+stop_loss_pct = 6.0
+take_profit_pct = 12.0
+trailing_stop_pct = 8.0
+max_holding_days = 20
+manage_options = true
+option_stop_loss_pct = 40.0
+option_take_profit_pct = 80.0
+
 [risk]
 max_risk_per_trade_pct = 2.0
 max_daily_loss_pct = 3.0
@@ -32,9 +42,9 @@ enabled = [
   "call_debit_spread",
   "put_debit_spread"
 ]
-allow_options = false
-allow_crypto = false
-allow_short = false
+allow_options = true
+allow_crypto = true
+allow_short = true
 min_signal_score = 70.0
 
 [research]

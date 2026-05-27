@@ -26,6 +26,17 @@ class AuditConfig(BaseModel):
     database_path: str = "data/trading_agent.sqlite3"
 
 
+class PositionManagerConfig(BaseModel):
+    enabled: bool = True
+    stop_loss_pct: float = Field(default=6.0, gt=0, le=100)
+    take_profit_pct: float = Field(default=12.0, gt=0, le=500)
+    trailing_stop_pct: float = Field(default=8.0, gt=0, le=100)
+    max_holding_days: int = Field(default=20, ge=0)
+    manage_options: bool = True
+    option_stop_loss_pct: float = Field(default=40.0, gt=0, le=100)
+    option_take_profit_pct: float = Field(default=80.0, gt=0, le=1000)
+
+
 class RiskConfig(BaseModel):
     max_risk_per_trade_pct: float = Field(default=2.0, gt=0, le=10)
     max_daily_loss_pct: float = Field(default=3.0, gt=0, le=20)
@@ -53,6 +64,7 @@ class Settings(BaseModel):
     broker: BrokerConfig = Field(default_factory=BrokerConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     audit: AuditConfig = Field(default_factory=AuditConfig)
+    position_manager: PositionManagerConfig = Field(default_factory=PositionManagerConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     research: ResearchConfig = Field(default_factory=ResearchConfig)

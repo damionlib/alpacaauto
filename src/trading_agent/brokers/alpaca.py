@@ -87,6 +87,9 @@ class AlpacaBroker:
                     avg_entry_price=float(row["avg_entry_price"])
                     if row.get("avg_entry_price")
                     else None,
+                    current_price=float(row["current_price"])
+                    if row.get("current_price")
+                    else None,
                     unrealized_pl=float(row["unrealized_pl"])
                     if row.get("unrealized_pl")
                     else None,

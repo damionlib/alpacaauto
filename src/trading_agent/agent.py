@@ -10,6 +10,7 @@ from trading_agent.audit import AuditStore
 from trading_agent.brokers.alpaca import AlpacaBroker
 from trading_agent.config import Settings
 from trading_agent.models import AssetClass, Position, RiskDecision, TradeCandidate
+from trading_agent.position_manager import PositionManager
 from trading_agent.research.service import ResearchService
 from trading_agent.risk import RiskEngine
 from trading_agent.strategies.momentum import MomentumStrategy
@@ -24,8 +25,9 @@ class TradingAgent:
         self.research = ResearchService(settings)
         self.momentum = MomentumStrategy(settings)
         self.options = OptionsStrategy(settings)
-        self.risk = RiskEngine(settings)
         self.audit = AuditStore(settings.audit.database_path) if settings.audit.enabled else None
+        self.position_manager = PositionManager(settings, self.audit)
+        self.risk = RiskEngine(settings)
 
     async def run_once(self) -> list[RiskDecision]:
         account = await self.broker.get_account()
@@ -47,44 +49,20 @@ class TradingAgent:
                 self.audit.finish_cycle(cycle_id, status="stopped")
             return []
         try:
-            candidates = await self._generate_candidates(positions, cycle_id)
+            if self.audit:
+                self.audit.reconcile_position_states({position.symbol for position in positions})
+            exit_candidates = self.position_manager.evaluate(positions)
+            for candidate in exit_candidates:
+                self._audit_candidate(cycle_id, candidate)
+            entry_candidates = await self._generate_candidates(positions, cycle_id)
+            candidates = [*exit_candidates, *entry_candidates]
             decisions = [self.risk.evaluate(candidate, account, positions) for candidate in candidates]
             for decision in decisions:
                 self._audit_decision(cycle_id, decision)
             self._print_decisions(account, decisions)
 
             if self.settings.agent.execute_orders:
-                submitted = 0
-                for decision in decisions:
-                    if submitted >= self.settings.agent.max_orders_per_cycle:
-                        break
-                    if not decision.approved or not decision.intent:
-                        continue
-                    try:
-                        order = await self.broker.submit_order(decision.intent)
-                    except Exception as exc:
-                        self.console.print(f"[red]order rejected[/red] {decision.intent.symbol}: {exc}")
-                        self._audit_event(
-                            cycle_id,
-                            "order",
-                            {"intent": decision.intent, "error": str(exc)},
-                            symbol=decision.intent.symbol,
-                            strategy=decision.candidate.strategy,
-                            status="rejected",
-                            reason=str(exc),
-                        )
-                        continue
-                    submitted += 1
-                    self._audit_event(
-                        cycle_id,
-                        "order",
-                        {"intent": decision.intent, "broker_order": order},
-                        symbol=decision.intent.symbol,
-                        strategy=decision.candidate.strategy,
-                        status="submitted",
-                        reason=order.get("status"),
-                    )
-                    self.console.print(f"[green]submitted[/green] {order.get('id')} {decision.intent.symbol}")
+                await self._submit_decisions(decisions, cycle_id)
             if self.audit and cycle_id:
                 self.audit.finish_cycle(cycle_id)
             return decisions
@@ -137,6 +115,58 @@ class TradingAgent:
                     self._audit_candidate(cycle_id, candidate)
                 candidates.extend(option_candidates)
         return sorted(candidates, key=lambda candidate: candidate.score, reverse=True)
+
+    async def _submit_decisions(
+        self,
+        decisions: list[RiskDecision],
+        cycle_id: int | None,
+    ) -> None:
+        exit_decisions = [
+            decision
+            for decision in decisions
+            if decision.candidate.metadata.get("exit")
+        ]
+        entry_decisions = [
+            decision
+            for decision in decisions
+            if not decision.candidate.metadata.get("exit")
+        ]
+
+        submitted_entries = 0
+        for decision in [*exit_decisions, *entry_decisions]:
+            if (
+                not decision.candidate.metadata.get("exit")
+                and submitted_entries >= self.settings.agent.max_orders_per_cycle
+            ):
+                break
+            if not decision.approved or not decision.intent:
+                continue
+            try:
+                order = await self.broker.submit_order(decision.intent)
+            except Exception as exc:
+                self.console.print(f"[red]order rejected[/red] {decision.intent.symbol}: {exc}")
+                self._audit_event(
+                    cycle_id,
+                    "order",
+                    {"intent": decision.intent, "error": str(exc)},
+                    symbol=decision.intent.symbol,
+                    strategy=decision.candidate.strategy,
+                    status="rejected",
+                    reason=str(exc),
+                )
+                continue
+            if not decision.candidate.metadata.get("exit"):
+                submitted_entries += 1
+            self._audit_event(
+                cycle_id,
+                "order",
+                {"intent": decision.intent, "broker_order": order},
+                symbol=decision.intent.symbol,
+                strategy=decision.candidate.strategy,
+                status="submitted",
+                reason=order.get("status"),
+            )
+            self.console.print(f"[green]submitted[/green] {order.get('id')} {decision.intent.symbol}")
 
     async def _option_candidates(
         self,

@@ -61,6 +61,33 @@ The dashboard shows:
 - research results from news and SEC company data
 - raw audit history with filters for review
 
+## Position Manager
+
+Before looking for new entries, the agent checks existing positions and can create exit trades. Exits are submitted before new entries and do not count against `max_orders_per_cycle`.
+
+Configured in `config/settings.toml`:
+
+```toml
+[position_manager]
+enabled = true
+stop_loss_pct = 6.0
+take_profit_pct = 12.0
+trailing_stop_pct = 8.0
+max_holding_days = 20
+manage_options = true
+option_stop_loss_pct = 40.0
+option_take_profit_pct = 80.0
+```
+
+The position manager checks:
+
+- unrealized P/L against stop-loss and take-profit thresholds
+- trailing drawdown from the tracked peak price
+- how long the position has been tracked
+- option-specific stop-loss/take-profit thresholds
+
+Exit candidates still pass through the risk engine before execution and are saved in the audit dashboard.
+
 Useful audit commands:
 
 ```bash
