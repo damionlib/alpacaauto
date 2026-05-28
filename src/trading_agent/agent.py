@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
+from datetime import datetime
 
 from rich.console import Console
 from rich.table import Table
@@ -121,6 +122,7 @@ class TradingAgent:
         decisions: list[RiskDecision],
         cycle_id: int | None,
     ) -> None:
+        open_orders = await self._open_order_reservations()
         exit_decisions = [
             decision
             for decision in decisions
@@ -140,6 +142,19 @@ class TradingAgent:
             ):
                 break
             if not decision.approved or not decision.intent:
+                continue
+            skip_reason = self._skip_due_to_open_orders(decision, open_orders)
+            if skip_reason:
+                self.console.print(f"[yellow]order skipped[/yellow] {decision.intent.symbol}: {skip_reason}")
+                self._audit_event(
+                    cycle_id,
+                    "order",
+                    {"intent": decision.intent, "open_orders": open_orders},
+                    symbol=decision.intent.symbol,
+                    strategy=decision.candidate.strategy,
+                    status="skipped",
+                    reason=skip_reason,
+                )
                 continue
             try:
                 order = await self.broker.submit_order(decision.intent)
@@ -167,6 +182,72 @@ class TradingAgent:
                 reason=order.get("status"),
             )
             self.console.print(f"[green]submitted[/green] {order.get('id')} {decision.intent.symbol}")
+
+    async def _open_order_reservations(self) -> dict:
+        try:
+            open_orders = await self.broker.get_open_orders()
+        except Exception as exc:
+            self.console.print(f"[yellow]open-order check failed[/yellow] {exc}")
+            return {"symbols": set(), "covered_call_contracts_by_underlying": {}, "orders": []}
+
+        symbols = set()
+        covered_call_contracts_by_underlying: dict[str, int] = {}
+        for order in open_orders:
+            symbol = str(order.get("symbol") or "")
+            side = str(order.get("side") or "")
+            qty = int(float(order.get("qty") or 0))
+            symbols.add(symbol)
+            parsed = self._parse_option_symbol(symbol)
+            if side == "sell" and parsed and parsed["type"] == "C":
+                underlying = parsed["underlying"]
+                covered_call_contracts_by_underlying[underlying] = (
+                    covered_call_contracts_by_underlying.get(underlying, 0) + qty
+                )
+        return {
+            "symbols": symbols,
+            "covered_call_contracts_by_underlying": covered_call_contracts_by_underlying,
+            "orders": open_orders,
+        }
+
+    def _skip_due_to_open_orders(self, decision: RiskDecision, open_orders: dict) -> str | None:
+        if not decision.intent:
+            return None
+        if decision.intent.symbol in open_orders["symbols"]:
+            return "Open order already exists for this symbol."
+        if decision.candidate.strategy != "covered_call":
+            return None
+
+        underlying = str(decision.candidate.metadata.get("underlying") or "")
+        contracts_per_100_shares = int(decision.candidate.metadata.get("contracts_per_100_shares") or 0)
+        already_reserved = open_orders["covered_call_contracts_by_underlying"].get(underlying, 0)
+        requested = int(decision.intent.qty or 0)
+        if already_reserved + requested > contracts_per_100_shares:
+            return (
+                f"Open covered-call orders already reserve {already_reserved * 100} "
+                f"of {contracts_per_100_shares * 100} available {underlying} shares."
+            )
+        return None
+
+    def _parse_option_symbol(self, symbol: str) -> dict | None:
+        # OCC-style symbols here look like AAPL260612C00322500.
+        for index, char in enumerate(symbol):
+            if char.isdigit():
+                if len(symbol) < index + 15:
+                    return None
+                date_part = symbol[index : index + 6]
+                option_type = symbol[index + 6 : index + 7]
+                if not date_part.isdigit() or option_type not in {"C", "P"}:
+                    return None
+                try:
+                    expiration = datetime.strptime(date_part, "%y%m%d").date().isoformat()
+                except ValueError:
+                    expiration = None
+                return {
+                    "underlying": symbol[:index],
+                    "expiration": expiration,
+                    "type": option_type,
+                }
+        return None
 
     async def _option_candidates(
         self,
