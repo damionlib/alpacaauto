@@ -137,4 +137,21 @@ mode = "live"
 - Max crypto position: 10% of equity
 - Max options premium per trade: 2% of equity
 
+## Cycle And Daily Order Caps
+
+The agent has separate paper/live loop intervals and daily order caps:
+
+```toml
+[agent]
+paper_cycle_seconds = 300
+live_cycle_seconds = 1800
+max_orders_per_cycle = 3
+paper_max_entry_orders_per_day = 12
+paper_max_total_orders_per_day = 24
+live_max_entry_orders_per_day = 3
+live_max_total_orders_per_day = 6
+```
+
+`max_orders_per_cycle` limits new entries per cycle. The daily caps limit submitted orders for the whole Central-time day. Exit orders count toward the total daily cap but not the daily entry cap.
+
 This software is not financial advice. It can lose money, especially if live trading is enabled.

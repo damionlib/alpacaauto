@@ -15,10 +15,27 @@ class BrokerConfig(BaseModel):
 
 
 class AgentConfig(BaseModel):
-    cycle_seconds: int = Field(default=300, ge=30)
+    cycle_seconds: int | None = Field(default=None, ge=30)
+    paper_cycle_seconds: int = Field(default=300, ge=30)
+    live_cycle_seconds: int = Field(default=1800, ge=30)
     run_on_weekends_for_crypto: bool = True
     execute_orders: bool = True
     max_orders_per_cycle: int = Field(default=3, ge=0)
+    paper_max_entry_orders_per_day: int = Field(default=12, ge=0)
+    paper_max_total_orders_per_day: int = Field(default=24, ge=0)
+    live_max_entry_orders_per_day: int = Field(default=3, ge=0)
+    live_max_total_orders_per_day: int = Field(default=6, ge=0)
+
+    def cycle_interval(self, *, live: bool) -> int:
+        if self.cycle_seconds is not None:
+            return self.cycle_seconds
+        return self.live_cycle_seconds if live else self.paper_cycle_seconds
+
+    def max_entry_orders_per_day(self, *, live: bool) -> int:
+        return self.live_max_entry_orders_per_day if live else self.paper_max_entry_orders_per_day
+
+    def max_total_orders_per_day(self, *, live: bool) -> int:
+        return self.live_max_total_orders_per_day if live else self.paper_max_total_orders_per_day
 
 
 class AuditConfig(BaseModel):

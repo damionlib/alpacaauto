@@ -5,6 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel
 
@@ -231,6 +232,38 @@ class AuditStore:
             events = connection.execute("select count(*) from audit_events").fetchone()[0]
         return {"cycles": int(cycles), "events": int(events)}
 
+    def order_counts_since(self, since: datetime) -> dict[str, int]:
+        since_text = since.astimezone(UTC).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                select payload_json
+                from audit_events
+                where event_type = 'order'
+                  and status = 'submitted'
+                  and created_at >= ?
+                """,
+                (since_text,),
+            ).fetchall()
+
+        total_orders = 0
+        entry_orders = 0
+        exit_orders = 0
+        for row in rows:
+            payload = self._loads(row["payload_json"]) or {}
+            intent = payload.get("intent") or {}
+            metadata = intent.get("metadata") or {}
+            total_orders += 1
+            if metadata.get("exit"):
+                exit_orders += 1
+            else:
+                entry_orders += 1
+        return {
+            "total_orders": total_orders,
+            "entry_orders": entry_orders,
+            "exit_orders": exit_orders,
+        }
+
     def update_position_state(
         self,
         *,
@@ -321,3 +354,13 @@ class AuditStore:
             "reason": row["reason"],
             "payload": self._loads(row["payload_json"]),
         }
+
+
+def start_of_trading_day(
+    *,
+    now: datetime | None = None,
+    timezone_name: str = "America/Chicago",
+) -> datetime:
+    timezone = ZoneInfo(timezone_name)
+    local_now = (now or datetime.now(UTC)).astimezone(timezone)
+    return local_now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)

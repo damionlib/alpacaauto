@@ -1,5 +1,7 @@
-from trading_agent.audit import AuditStore
-from trading_agent.models import AccountSnapshot, AssetClass, MarketSnapshot, Position
+from datetime import UTC, datetime, timedelta
+
+from trading_agent.audit import AuditStore, start_of_trading_day
+from trading_agent.models import AccountSnapshot, AssetClass, MarketSnapshot, OrderIntent, OrderSide, Position
 
 
 def test_audit_store_records_cycle_and_events(tmp_path) -> None:
@@ -91,3 +93,50 @@ def test_reconcile_position_states_removes_closed_symbols(tmp_path) -> None:
             for row in connection.execute("select symbol from position_state order by symbol").fetchall()
         ]
     assert symbols == ["AAPL"]
+
+
+def test_order_counts_since_splits_entries_and_exits(tmp_path) -> None:
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    cycle_id = store.start_cycle(
+        AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000),
+        [],
+    )
+    store.record_event(
+        cycle_id=cycle_id,
+        event_type="order",
+        payload={
+            "intent": OrderIntent(
+                symbol="AAPL",
+                asset_class=AssetClass.EQUITY,
+                side=OrderSide.BUY,
+                qty=1,
+            )
+        },
+        symbol="AAPL",
+        status="submitted",
+    )
+    store.record_event(
+        cycle_id=cycle_id,
+        event_type="order",
+        payload={
+            "intent": OrderIntent(
+                symbol="AAPL",
+                asset_class=AssetClass.EQUITY,
+                side=OrderSide.SELL,
+                qty=1,
+                metadata={"exit": True},
+            )
+        },
+        symbol="AAPL",
+        status="submitted",
+    )
+
+    counts = store.order_counts_since(datetime.now(UTC) - timedelta(minutes=1))
+
+    assert counts == {"total_orders": 2, "entry_orders": 1, "exit_orders": 1}
+
+
+def test_start_of_trading_day_uses_central_midnight() -> None:
+    start = start_of_trading_day(now=datetime(2026, 5, 28, 15, 30, tzinfo=UTC))
+
+    assert start == datetime(2026, 5, 28, 5, 0, tzinfo=UTC)

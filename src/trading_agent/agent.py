@@ -7,7 +7,7 @@ from datetime import datetime
 from rich.console import Console
 from rich.table import Table
 
-from trading_agent.audit import AuditStore
+from trading_agent.audit import AuditStore, start_of_trading_day
 from trading_agent.brokers.alpaca import AlpacaBroker
 from trading_agent.config import Settings
 from trading_agent.models import AssetClass, Position, RiskDecision, TradeCandidate
@@ -78,7 +78,7 @@ class TradingAgent:
                 await self.run_once()
             except Exception as exc:
                 self.console.print(f"[red]agent cycle failed[/red] {exc}")
-            await asyncio.sleep(self.settings.agent.cycle_seconds)
+            await asyncio.sleep(self.settings.agent.cycle_interval(live=self.settings.is_live))
 
     async def _generate_candidates(
         self,
@@ -123,6 +123,9 @@ class TradingAgent:
         cycle_id: int | None,
     ) -> None:
         open_orders = await self._open_order_reservations()
+        daily_counts = self._daily_order_counts()
+        max_entry_orders = self.settings.agent.max_entry_orders_per_day(live=self.settings.is_live)
+        max_total_orders = self.settings.agent.max_total_orders_per_day(live=self.settings.is_live)
         exit_decisions = [
             decision
             for decision in decisions
@@ -135,6 +138,7 @@ class TradingAgent:
         ]
 
         submitted_entries = 0
+        submitted_total = 0
         for decision in [*exit_decisions, *entry_decisions]:
             if (
                 not decision.candidate.metadata.get("exit")
@@ -142,6 +146,26 @@ class TradingAgent:
             ):
                 break
             if not decision.approved or not decision.intent:
+                continue
+            cap_reason = self._daily_cap_reason(
+                decision,
+                daily_counts=daily_counts,
+                submitted_entries=submitted_entries,
+                submitted_total=submitted_total,
+                max_entry_orders=max_entry_orders,
+                max_total_orders=max_total_orders,
+            )
+            if cap_reason:
+                self.console.print(f"[yellow]order skipped[/yellow] {decision.intent.symbol}: {cap_reason}")
+                self._audit_event(
+                    cycle_id,
+                    "order",
+                    {"intent": decision.intent, "daily_counts": daily_counts},
+                    symbol=decision.intent.symbol,
+                    strategy=decision.candidate.strategy,
+                    status="skipped",
+                    reason=cap_reason,
+                )
                 continue
             skip_reason = self._skip_due_to_open_orders(decision, open_orders)
             if skip_reason:
@@ -172,6 +196,7 @@ class TradingAgent:
                 continue
             if not decision.candidate.metadata.get("exit"):
                 submitted_entries += 1
+            submitted_total += 1
             self._audit_event(
                 cycle_id,
                 "order",
@@ -182,6 +207,38 @@ class TradingAgent:
                 reason=order.get("status"),
             )
             self.console.print(f"[green]submitted[/green] {order.get('id')} {decision.intent.symbol}")
+
+    def _daily_order_counts(self) -> dict[str, int]:
+        if not self.audit:
+            return {"total_orders": 0, "entry_orders": 0, "exit_orders": 0}
+        return self.audit.order_counts_since(start_of_trading_day())
+
+    def _daily_cap_reason(
+        self,
+        decision: RiskDecision,
+        *,
+        daily_counts: dict[str, int],
+        submitted_entries: int,
+        submitted_total: int,
+        max_entry_orders: int,
+        max_total_orders: int,
+    ) -> str | None:
+        projected_total = daily_counts["total_orders"] + submitted_total + 1
+        if max_total_orders and projected_total > max_total_orders:
+            return (
+                f"Daily total order cap reached "
+                f"({daily_counts['total_orders']}/{max_total_orders} already submitted today)."
+            )
+        if decision.candidate.metadata.get("exit"):
+            return None
+
+        projected_entries = daily_counts["entry_orders"] + submitted_entries + 1
+        if max_entry_orders and projected_entries > max_entry_orders:
+            return (
+                f"Daily entry order cap reached "
+                f"({daily_counts['entry_orders']}/{max_entry_orders} already submitted today)."
+            )
+        return None
 
     async def _open_order_reservations(self) -> dict:
         try:

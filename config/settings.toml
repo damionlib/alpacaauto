@@ -3,10 +3,15 @@ provider = "alpaca"
 mode = "paper"
 
 [agent]
-cycle_seconds = 300
+paper_cycle_seconds = 300
+live_cycle_seconds = 1800
 run_on_weekends_for_crypto = true
 execute_orders = true
 max_orders_per_cycle = 3
+paper_max_entry_orders_per_day = 12
+paper_max_total_orders_per_day = 24
+live_max_entry_orders_per_day = 3
+live_max_total_orders_per_day = 6
 
 [audit]
 enabled = true
