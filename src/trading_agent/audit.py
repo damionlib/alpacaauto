@@ -18,6 +18,8 @@ def to_jsonable(value: Any) -> Any:
         return value.model_dump(mode="json")
     if isinstance(value, list):
         return [to_jsonable(item) for item in value]
+    if isinstance(value, set):
+        return sorted(to_jsonable(item) for item in value)
     if isinstance(value, dict):
         return {key: to_jsonable(item) for key, item in value.items()}
     return value
