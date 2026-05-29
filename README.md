@@ -143,9 +143,10 @@ Useful audit commands:
 trading-agent audit-status
 trading-agent audit-backup
 trading-agent audit-export
+trading-agent broker-sync --days 30
 ```
 
-`audit-backup` creates a SQLite backup copy. `audit-export` writes a JSON review file.
+`audit-backup` creates a SQLite backup copy. `audit-export` writes a JSON review file. `broker-sync` is read-only against Alpaca and backfills closed broker orders into SQLite so the performance report can calculate realized P/L from fills.
 
 Start the local dashboard:
 

@@ -179,6 +179,7 @@ class AlpacaBroker:
         status: str = "closed",
         limit: int = 100,
         after: str | None = None,
+        until: str | None = None,
     ) -> list[dict]:
         params: dict[str, Any] = {
             "status": status,
@@ -187,6 +188,8 @@ class AlpacaBroker:
         }
         if after:
             params["after"] = after
+        if until:
+            params["until"] = until
         return await self._request("GET", f"{self.trading_base_url}/v2/orders", params=params)
 
     async def _get_equity_snapshot(self, symbol: str) -> MarketSnapshot:
