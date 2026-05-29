@@ -113,6 +113,30 @@ crypto_exchange_flows_enabled = false
 
 Exchange-flow and on-chain data are intentionally marked as not configured until a supported provider is added. The crypto momentum strategy uses the crypto regime and risk flags to adjust scores before creating entry candidates.
 
+## Market Screener
+
+By default, the agent uses the fixed `strategy.symbols` list. When the screener is enabled, it scans configured universes, filters for liquidity/trend/volatility, and passes only top candidates into the research and risk pipeline.
+
+```toml
+[screener]
+enabled = false
+max_candidates = 10
+max_crypto_candidates = 3
+universes = ["nasdaq100", "sp500_core", "crypto_major"]
+min_price = 5.0
+min_avg_dollar_volume = 25000000.0
+max_realized_volatility_pct = 90.0
+min_trend_score = 45.0
+```
+
+Use the screener for normal paper observation once you are comfortable with the system. Use the fixed `strategy.symbols` list when debugging, testing a small watchlist, or running your first live trials.
+
+Preview screener output without placing trades:
+
+```bash
+trading-agent screen
+```
+
 Useful audit commands:
 
 ```bash

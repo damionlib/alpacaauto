@@ -58,6 +58,7 @@ class MarketSnapshot(BaseModel):
     asset_class: AssetClass
     price: float
     closes: list[float] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
     as_of: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 

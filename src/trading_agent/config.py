@@ -72,6 +72,17 @@ class StrategyConfig(BaseModel):
     min_signal_score: float = Field(default=70.0, ge=0, le=100)
 
 
+class ScreenerConfig(BaseModel):
+    enabled: bool = False
+    max_candidates: int = Field(default=10, ge=1, le=100)
+    max_crypto_candidates: int = Field(default=3, ge=0, le=25)
+    universes: list[str] = Field(default_factory=lambda: ["nasdaq100", "sp500_core", "crypto_major"])
+    min_price: float = Field(default=5.0, ge=0)
+    min_avg_dollar_volume: float = Field(default=25_000_000.0, ge=0)
+    max_realized_volatility_pct: float = Field(default=90.0, gt=0)
+    min_trend_score: float = Field(default=45.0, ge=0, le=100)
+
+
 class ResearchConfig(BaseModel):
     news_headline_limit: int = Field(default=8, ge=0, le=50)
     sec_companyfacts_enabled: bool = True
@@ -88,6 +99,7 @@ class Settings(BaseModel):
     position_manager: PositionManagerConfig = Field(default_factory=PositionManagerConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
+    screener: ScreenerConfig = Field(default_factory=ScreenerConfig)
     research: ResearchConfig = Field(default_factory=ResearchConfig)
     alpaca_api_key_id: SecretStr | None = None
     alpaca_api_secret_key: SecretStr | None = None

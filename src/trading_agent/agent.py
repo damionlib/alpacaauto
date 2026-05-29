@@ -14,6 +14,7 @@ from trading_agent.models import AssetClass, Position, RiskDecision, TradeCandid
 from trading_agent.position_manager import PositionManager
 from trading_agent.research.service import ResearchService
 from trading_agent.risk import RiskEngine
+from trading_agent.screener.service import MarketScreener
 from trading_agent.strategies.momentum import MomentumStrategy
 from trading_agent.strategies.options import OptionsStrategy
 
@@ -29,6 +30,7 @@ class TradingAgent:
         self.audit = AuditStore(settings.audit.database_path) if settings.audit.enabled else None
         self.position_manager = PositionManager(settings, self.audit)
         self.risk = RiskEngine(settings)
+        self.screener = MarketScreener(settings, self.broker)
 
     async def run_once(self) -> list[RiskDecision]:
         account = await self.broker.get_account()
@@ -86,8 +88,8 @@ class TradingAgent:
         cycle_id: int | None = None,
     ) -> list[TradeCandidate]:
         candidates: list[TradeCandidate] = []
-        for symbol in self.settings.strategy.symbols:
-            market = await self.broker.get_market_snapshot(symbol)
+        screened = await self._screened_symbols(cycle_id)
+        for symbol, market in screened:
             self._audit_event(
                 cycle_id,
                 "market_snapshot",
@@ -116,6 +118,40 @@ class TradingAgent:
                     self._audit_candidate(cycle_id, candidate)
                 candidates.extend(option_candidates)
         return sorted(candidates, key=lambda candidate: candidate.score, reverse=True)
+
+    async def _screened_symbols(
+        self,
+        cycle_id: int | None,
+    ) -> list[tuple[str, object]]:
+        if self.settings.screener.enabled:
+            screened = await self.screener.top_symbols()
+            self._audit_event(
+                cycle_id,
+                "screener_result",
+                {
+                    "enabled": True,
+                    "symbols": [
+                        {
+                            "symbol": item.symbol,
+                            "asset_class": item.asset_class.value,
+                            "score": item.score,
+                            "reasons": item.reasons,
+                        }
+                        for item in screened
+                    ],
+                    "fallback_symbols": self.settings.strategy.symbols,
+                },
+                status="captured",
+            )
+            if screened:
+                return [(item.symbol, item.snapshot) for item in screened]
+            self.console.print("[yellow]screener returned no symbols; falling back to configured symbols[/yellow]")
+
+        symbols: list[tuple[str, object]] = []
+        for symbol in self.settings.strategy.symbols:
+            market = await self.broker.get_market_snapshot(symbol)
+            symbols.append((symbol, market))
+        return symbols
 
     async def _submit_decisions(
         self,

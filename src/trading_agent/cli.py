@@ -12,6 +12,7 @@ from trading_agent.audit import AuditStore
 from trading_agent.brokers.alpaca import AlpacaBroker
 from trading_agent.config import load_settings
 from trading_agent.dashboard import serve_dashboard
+from trading_agent.screener.service import MarketScreener
 
 
 app = typer.Typer(help="Research, risk, and execution agent for API-first trading.")
@@ -83,6 +84,26 @@ def run_once(config: str = "config/settings.toml") -> None:
     settings = load_settings(config)
     agent = TradingAgent(settings, console=console)
     asyncio.run(agent.run_once())
+
+
+@app.command()
+def screen(config: str = "config/settings.toml") -> None:
+    async def _run() -> None:
+        settings = load_settings(config)
+        broker = AlpacaBroker(settings)
+        screener = MarketScreener(settings, broker)
+        rows = await screener.top_symbols()
+        table = Table("Symbol", "Class", "Score", "Reasons")
+        for row in rows:
+            table.add_row(
+                row.symbol,
+                row.asset_class.value,
+                f"{row.score:.2f}",
+                "; ".join(row.reasons),
+            )
+        console.print(table if rows else "No screener candidates.")
+
+    asyncio.run(_run())
 
 
 @app.command()
