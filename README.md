@@ -147,6 +147,14 @@ trading-agent audit-export
 
 `audit-backup` creates a SQLite backup copy. `audit-export` writes a JSON review file.
 
+Start the local dashboard:
+
+```bash
+trading-agent dashboard
+```
+
+The dashboard includes trade decisions, orders, market snapshots, research, audit history, and a performance report with equity drawdown, win rate, open P/L, exit-signal P/L, and strategy-level assessment.
+
 ## Continuous Run On macOS
 
 For a terminal session:

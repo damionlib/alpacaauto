@@ -173,6 +173,22 @@ class AlpacaBroker:
             params={"status": "open", "limit": 100, "direction": "desc"},
         )
 
+    async def get_recent_orders(
+        self,
+        *,
+        status: str = "closed",
+        limit: int = 100,
+        after: str | None = None,
+    ) -> list[dict]:
+        params: dict[str, Any] = {
+            "status": status,
+            "limit": limit,
+            "direction": "desc",
+        }
+        if after:
+            params["after"] = after
+        return await self._request("GET", f"{self.trading_base_url}/v2/orders", params=params)
+
     async def _get_equity_snapshot(self, symbol: str) -> MarketSnapshot:
         latest = await self._request(
             "GET",

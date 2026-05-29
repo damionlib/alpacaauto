@@ -203,6 +203,14 @@ class AuditStore:
             "research_results": self.events(cycle_id=cycle_id, event_type="research_result", limit=500),
         }
 
+    def performance_report(self) -> dict[str, Any]:
+        from trading_agent.performance import build_performance_report
+
+        return build_performance_report(
+            cycles=self.recent_cycles(limit=1_000_000),
+            events=self.events(limit=1_000_000),
+        )
+
     def backup(self, backup_path: str | Path | None = None) -> Path:
         if backup_path is None:
             timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -263,6 +271,21 @@ class AuditStore:
             "entry_orders": entry_orders,
             "exit_orders": exit_orders,
         }
+
+    def broker_order_update_exists(self, broker_order_id: str) -> bool:
+        pattern = f'%"id": "{broker_order_id}"%'
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                select 1
+                from audit_events
+                where event_type = 'broker_order_update'
+                  and payload_json like ?
+                limit 1
+                """,
+                (pattern,),
+            ).fetchone()
+        return row is not None
 
     def update_position_state(
         self,

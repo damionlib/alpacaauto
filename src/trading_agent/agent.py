@@ -66,6 +66,7 @@ class TradingAgent:
 
             if self.settings.agent.execute_orders:
                 await self._submit_decisions(decisions, cycle_id)
+                await self._audit_recent_order_updates(cycle_id)
             if self.audit and cycle_id:
                 self.audit.finish_cycle(cycle_id)
             return decisions
@@ -244,6 +245,40 @@ class TradingAgent:
             )
             self.console.print(f"[green]submitted[/green] {order.get('id')} {decision.intent.symbol}")
 
+    async def _audit_recent_order_updates(self, cycle_id: int | None) -> None:
+        if not self.audit:
+            return
+        try:
+            orders = await self.broker.get_recent_orders(
+                status="closed",
+                limit=100,
+                after=start_of_trading_day().isoformat(),
+            )
+        except Exception as exc:
+            self.console.print(f"[yellow]order fill audit skipped[/yellow] {exc}")
+            self._audit_event(
+                cycle_id,
+                "broker_order_update",
+                {"error": str(exc)},
+                status="failed",
+                reason=str(exc),
+            )
+            return
+
+        for order in orders:
+            order_id = str(order.get("id") or "")
+            if order_id and self.audit.broker_order_update_exists(order_id):
+                continue
+            self._audit_event(
+                cycle_id,
+                "broker_order_update",
+                {"broker_order": order},
+                symbol=order.get("symbol"),
+                strategy=self._strategy_from_client_order_id(order),
+                status=order.get("status"),
+                reason=order.get("filled_at") or order.get("canceled_at") or order.get("expired_at"),
+            )
+
     def _daily_order_counts(self) -> dict[str, int]:
         if not self.audit:
             return {"total_orders": 0, "entry_orders": 0, "exit_orders": 0}
@@ -341,6 +376,13 @@ class TradingAgent:
                     "type": option_type,
                 }
         return None
+
+    def _strategy_from_client_order_id(self, order: dict) -> str | None:
+        client_order_id = str(order.get("client_order_id") or "")
+        if not client_order_id.startswith("ta-"):
+            return None
+        strategy = client_order_id[3:].rsplit("-", 1)[0]
+        return strategy or None
 
     async def _option_candidates(
         self,
