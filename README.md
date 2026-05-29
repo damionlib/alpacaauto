@@ -88,6 +88,31 @@ The position manager checks:
 
 Exit candidates still pass through the risk engine before execution and are saved in the audit dashboard.
 
+## Crypto Research
+
+Crypto symbols such as `BTC/USD` and `ETH/USD` use a separate crypto research path. When enabled, the agent records:
+
+- crypto market regime and score
+- BTC and ETH dominance
+- total crypto market cap and volume
+- asset 24h/7d/30d performance
+- crypto fear/greed reading
+- stablecoin circulating supply snapshot
+- perpetual funding-rate snapshot for supported BTC/ETH pairs
+- explicit status for exchange-flow and on-chain feeds
+
+Configured in `config/settings.toml`:
+
+```toml
+[research]
+crypto_research_enabled = true
+crypto_onchain_enabled = false
+crypto_onchain_provider = ""
+crypto_exchange_flows_enabled = false
+```
+
+Exchange-flow and on-chain data are intentionally marked as not configured until a supported provider is added. The crypto momentum strategy uses the crypto regime and risk flags to adjust scores before creating entry candidates.
+
 Useful audit commands:
 
 ```bash

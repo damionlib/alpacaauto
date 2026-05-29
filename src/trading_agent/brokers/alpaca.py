@@ -81,7 +81,7 @@ class AlpacaBroker:
             positions.append(
                 Position(
                     symbol=row["symbol"],
-                    asset_class=self._asset_class_from_alpaca(row.get("asset_class")),
+                    asset_class=self._asset_class_from_alpaca(row.get("asset_class"), row["symbol"]),
                     qty=float(row["qty"]),
                     market_value=float(row["market_value"]),
                     avg_entry_price=float(row["avg_entry_price"])
@@ -287,7 +287,9 @@ class AlpacaBroker:
             for symbol, bars in data.get("bars", {}).items()
         }
 
-    def _asset_class_from_alpaca(self, value: str | None) -> AssetClass:
+    def _asset_class_from_alpaca(self, value: str | None, symbol: str = "") -> AssetClass:
+        if self._looks_like_option_symbol(symbol):
+            return AssetClass.OPTION
         if value == "crypto":
             return AssetClass.CRYPTO
         if value == "option":

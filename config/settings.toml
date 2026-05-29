@@ -55,3 +55,7 @@ min_signal_score = 70.0
 [research]
 news_headline_limit = 8
 sec_companyfacts_enabled = true
+crypto_research_enabled = true
+crypto_onchain_enabled = false
+crypto_onchain_provider = ""
+crypto_exchange_flows_enabled = false

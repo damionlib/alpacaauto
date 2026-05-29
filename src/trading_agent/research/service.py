@@ -4,6 +4,7 @@ import asyncio
 
 from trading_agent.config import Settings
 from trading_agent.models import ResearchSnapshot
+from trading_agent.research.crypto import CryptoResearchService
 from trading_agent.research.news import YahooFinanceNews
 from trading_agent.research.sec import SecClient
 
@@ -13,9 +14,11 @@ class ResearchService:
         self.settings = settings
         self.news = YahooFinanceNews()
         self.sec = SecClient(settings.sec_user_agent)
+        self.crypto = CryptoResearchService(settings)
 
     async def research_symbol(self, symbol: str) -> ResearchSnapshot:
         if "/" in symbol:
+            crypto_task = self.crypto.research(symbol)
             try:
                 news = await self.news.headlines(
                     symbol.replace("/", "-"),
@@ -28,7 +31,14 @@ class ResearchService:
                     "Crypto asset; SEC company facts skipped.",
                     f"News lookup failed: {exc}",
                 ]
-            return ResearchSnapshot(symbol=symbol, news=news, notes=notes)
+            crypto_summary, crypto_notes = await crypto_task
+            notes.extend(crypto_notes)
+            return ResearchSnapshot(
+                symbol=symbol,
+                news=news,
+                crypto_summary=crypto_summary,
+                notes=notes,
+            )
 
         news_task = self.news.headlines(symbol, self.settings.research.news_headline_limit)
         sec_task = (

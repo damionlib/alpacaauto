@@ -71,6 +71,7 @@ class ResearchSnapshot(BaseModel):
     symbol: str
     news: list[NewsItem] = Field(default_factory=list)
     sec_summary: dict[str, Any] = Field(default_factory=dict)
+    crypto_summary: dict[str, Any] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
 
 

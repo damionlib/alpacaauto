@@ -75,6 +75,10 @@ class StrategyConfig(BaseModel):
 class ResearchConfig(BaseModel):
     news_headline_limit: int = Field(default=8, ge=0, le=50)
     sec_companyfacts_enabled: bool = True
+    crypto_research_enabled: bool = True
+    crypto_onchain_enabled: bool = False
+    crypto_onchain_provider: str | None = None
+    crypto_exchange_flows_enabled: bool = False
 
 
 class Settings(BaseModel):

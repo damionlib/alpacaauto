@@ -430,9 +430,12 @@ DASHBOARD_HTML = r"""<!doctype html>
         const data = payload(event);
         const filings = data.sec_summary?.recent_filings || [];
         const latestFiling = filings[0] ? `${filings[0].form} ${filings[0].filing_date}` : "";
+        const regime = data.crypto_summary?.regime;
+        const cryptoText = regime ? `${regime.label} ${regime.score}` : "";
         return {
           symbol: esc(event.symbol),
           entity: esc(data.sec_summary?.entity_name || ""),
+          crypto: esc(cryptoText),
           headlines: esc((data.news || []).length),
           filing: esc(latestFiling),
           notes: `<div class="detail">${esc((data.notes || []).join(" | "))}</div>`,
@@ -441,6 +444,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       renderTable("research", [
         { key: "symbol", label: "Symbol" },
         { key: "entity", label: "Entity" },
+        { key: "crypto", label: "Crypto Regime" },
         { key: "headlines", label: "Headlines", cls: "num" },
         { key: "filing", label: "Latest Filing" },
         { key: "notes", label: "Notes" },

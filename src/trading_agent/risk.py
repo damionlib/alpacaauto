@@ -73,8 +73,9 @@ class RiskEngine:
             asset_class=candidate.asset_class,
             side=candidate.side,
             qty=qty,
-            order_type=OrderType.MARKET,
+            order_type=OrderType.LIMIT if candidate.asset_class == AssetClass.OPTION else OrderType.MARKET,
             time_in_force=TimeInForce.GTC if candidate.asset_class == AssetClass.CRYPTO else TimeInForce.DAY,
+            limit_price=round(candidate.entry_price, 2) if candidate.asset_class == AssetClass.OPTION else None,
             client_order_id=self._client_order_id(candidate),
             metadata=candidate.metadata,
         )

@@ -125,6 +125,9 @@ class PositionManager:
         return abs(position.market_value)
 
     def _exit_reason(self, position: Position, metrics: dict) -> dict | None:
+        if position.asset_class == AssetClass.OPTION and position.qty < 0:
+            return self._short_option_exit_reason(position, metrics)
+
         pnl_pct = metrics["pnl_pct"]
         if pnl_pct is None:
             return None
@@ -175,6 +178,30 @@ class PositionManager:
                 "score": 80,
                 "rationale": [
                     f"Position has been tracked for {metrics['holding_days']} days, meeting max holding period."
+                ],
+            }
+        return None
+
+    def _short_option_exit_reason(self, position: Position, metrics: dict) -> dict | None:
+        pnl_pct = metrics["pnl_pct"]
+        if pnl_pct is None:
+            return None
+        stop_loss_pct = self.settings.position_manager.option_stop_loss_pct
+        take_profit_pct = self.settings.position_manager.option_take_profit_pct
+        if pnl_pct <= -stop_loss_pct:
+            return {
+                "strategy": "short_option_stop_loss_exit",
+                "score": 100,
+                "rationale": [
+                    f"Short option P/L is {pnl_pct:.2f}%, below stop loss threshold {-stop_loss_pct:.2f}%."
+                ],
+            }
+        if pnl_pct >= take_profit_pct:
+            return {
+                "strategy": "short_option_take_profit_exit",
+                "score": 95,
+                "rationale": [
+                    f"Short option P/L is {pnl_pct:.2f}%, above take profit threshold {take_profit_pct:.2f}%."
                 ],
             }
         return None
