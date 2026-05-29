@@ -7,13 +7,15 @@ from datetime import datetime
 from rich.console import Console
 from rich.table import Table
 
-from trading_agent.audit import AuditStore
+from trading_agent.audit import AuditStore, start_of_trading_day
+from trading_agent.broker_sync import BrokerOrderSync
 from trading_agent.brokers.alpaca import AlpacaBroker
 from trading_agent.config import Settings
 from trading_agent.models import AssetClass, Position, RiskDecision, TradeCandidate
 from trading_agent.position_manager import PositionManager
 from trading_agent.research.service import ResearchService
 from trading_agent.risk import RiskEngine
+from trading_agent.screener.service import MarketScreener
 from trading_agent.strategies.momentum import MomentumStrategy
 from trading_agent.strategies.options import OptionsStrategy
 
@@ -27,8 +29,10 @@ class TradingAgent:
         self.momentum = MomentumStrategy(settings)
         self.options = OptionsStrategy(settings)
         self.audit = AuditStore(settings.audit.database_path) if settings.audit.enabled else None
+        self.broker_sync = BrokerOrderSync(self.broker, self.audit, self.console) if self.audit else None
         self.position_manager = PositionManager(settings, self.audit)
         self.risk = RiskEngine(settings)
+        self.screener = MarketScreener(settings, self.broker)
 
     async def run_once(self) -> list[RiskDecision]:
         account = await self.broker.get_account()
@@ -64,6 +68,7 @@ class TradingAgent:
 
             if self.settings.agent.execute_orders:
                 await self._submit_decisions(decisions, cycle_id)
+                await self._sync_recent_order_updates(cycle_id)
             if self.audit and cycle_id:
                 self.audit.finish_cycle(cycle_id)
             return decisions
@@ -78,7 +83,7 @@ class TradingAgent:
                 await self.run_once()
             except Exception as exc:
                 self.console.print(f"[red]agent cycle failed[/red] {exc}")
-            await asyncio.sleep(self.settings.agent.cycle_seconds)
+            await asyncio.sleep(self.settings.agent.cycle_interval(live=self.settings.is_live))
 
     async def _generate_candidates(
         self,
@@ -86,8 +91,8 @@ class TradingAgent:
         cycle_id: int | None = None,
     ) -> list[TradeCandidate]:
         candidates: list[TradeCandidate] = []
-        for symbol in self.settings.strategy.symbols:
-            market = await self.broker.get_market_snapshot(symbol)
+        screened = await self._screened_symbols(cycle_id)
+        for symbol, market in screened:
             self._audit_event(
                 cycle_id,
                 "market_snapshot",
@@ -117,12 +122,49 @@ class TradingAgent:
                 candidates.extend(option_candidates)
         return sorted(candidates, key=lambda candidate: candidate.score, reverse=True)
 
+    async def _screened_symbols(
+        self,
+        cycle_id: int | None,
+    ) -> list[tuple[str, object]]:
+        if self.settings.screener.enabled:
+            screened = await self.screener.top_symbols()
+            self._audit_event(
+                cycle_id,
+                "screener_result",
+                {
+                    "enabled": True,
+                    "symbols": [
+                        {
+                            "symbol": item.symbol,
+                            "asset_class": item.asset_class.value,
+                            "score": item.score,
+                            "reasons": item.reasons,
+                        }
+                        for item in screened
+                    ],
+                    "fallback_symbols": self.settings.strategy.symbols,
+                },
+                status="captured",
+            )
+            if screened:
+                return [(item.symbol, item.snapshot) for item in screened]
+            self.console.print("[yellow]screener returned no symbols; falling back to configured symbols[/yellow]")
+
+        symbols: list[tuple[str, object]] = []
+        for symbol in self.settings.strategy.symbols:
+            market = await self.broker.get_market_snapshot(symbol)
+            symbols.append((symbol, market))
+        return symbols
+
     async def _submit_decisions(
         self,
         decisions: list[RiskDecision],
         cycle_id: int | None,
     ) -> None:
         open_orders = await self._open_order_reservations()
+        daily_counts = self._daily_order_counts()
+        max_entry_orders = self.settings.agent.max_entry_orders_per_day(live=self.settings.is_live)
+        max_total_orders = self.settings.agent.max_total_orders_per_day(live=self.settings.is_live)
         exit_decisions = [
             decision
             for decision in decisions
@@ -135,6 +177,7 @@ class TradingAgent:
         ]
 
         submitted_entries = 0
+        submitted_total = 0
         for decision in [*exit_decisions, *entry_decisions]:
             if (
                 not decision.candidate.metadata.get("exit")
@@ -142,6 +185,26 @@ class TradingAgent:
             ):
                 break
             if not decision.approved or not decision.intent:
+                continue
+            cap_reason = self._daily_cap_reason(
+                decision,
+                daily_counts=daily_counts,
+                submitted_entries=submitted_entries,
+                submitted_total=submitted_total,
+                max_entry_orders=max_entry_orders,
+                max_total_orders=max_total_orders,
+            )
+            if cap_reason:
+                self.console.print(f"[yellow]order skipped[/yellow] {decision.intent.symbol}: {cap_reason}")
+                self._audit_event(
+                    cycle_id,
+                    "order",
+                    {"intent": decision.intent, "daily_counts": daily_counts},
+                    symbol=decision.intent.symbol,
+                    strategy=decision.candidate.strategy,
+                    status="skipped",
+                    reason=cap_reason,
+                )
                 continue
             skip_reason = self._skip_due_to_open_orders(decision, open_orders)
             if skip_reason:
@@ -172,6 +235,7 @@ class TradingAgent:
                 continue
             if not decision.candidate.metadata.get("exit"):
                 submitted_entries += 1
+            submitted_total += 1
             self._audit_event(
                 cycle_id,
                 "order",
@@ -182,6 +246,57 @@ class TradingAgent:
                 reason=order.get("status"),
             )
             self.console.print(f"[green]submitted[/green] {order.get('id')} {decision.intent.symbol}")
+
+    async def _sync_recent_order_updates(self, cycle_id: int | None) -> None:
+        if not self.broker_sync:
+            return
+        try:
+            await self.broker_sync.sync_closed_orders(
+                cycle_id=cycle_id,
+                after=start_of_trading_day().isoformat(),
+            )
+        except Exception as exc:
+            self.console.print(f"[yellow]order fill audit skipped[/yellow] {exc}")
+            self._audit_event(
+                cycle_id,
+                "broker_order_update",
+                {"error": str(exc)},
+                status="failed",
+                reason=str(exc),
+            )
+            return
+
+    def _daily_order_counts(self) -> dict[str, int]:
+        if not self.audit:
+            return {"total_orders": 0, "entry_orders": 0, "exit_orders": 0}
+        return self.audit.order_counts_since(start_of_trading_day())
+
+    def _daily_cap_reason(
+        self,
+        decision: RiskDecision,
+        *,
+        daily_counts: dict[str, int],
+        submitted_entries: int,
+        submitted_total: int,
+        max_entry_orders: int,
+        max_total_orders: int,
+    ) -> str | None:
+        projected_total = daily_counts["total_orders"] + submitted_total + 1
+        if max_total_orders and projected_total > max_total_orders:
+            return (
+                f"Daily total order cap reached "
+                f"({daily_counts['total_orders']}/{max_total_orders} already submitted today)."
+            )
+        if decision.candidate.metadata.get("exit"):
+            return None
+
+        projected_entries = daily_counts["entry_orders"] + submitted_entries + 1
+        if max_entry_orders and projected_entries > max_entry_orders:
+            return (
+                f"Daily entry order cap reached "
+                f"({daily_counts['entry_orders']}/{max_entry_orders} already submitted today)."
+            )
+        return None
 
     async def _open_order_reservations(self) -> dict:
         try:

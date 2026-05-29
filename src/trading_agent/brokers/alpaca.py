@@ -81,7 +81,7 @@ class AlpacaBroker:
             positions.append(
                 Position(
                     symbol=row["symbol"],
-                    asset_class=self._asset_class_from_alpaca(row.get("asset_class")),
+                    asset_class=self._asset_class_from_alpaca(row.get("asset_class"), row["symbol"]),
                     qty=float(row["qty"]),
                     market_value=float(row["market_value"]),
                     avg_entry_price=float(row["avg_entry_price"])
@@ -173,6 +173,25 @@ class AlpacaBroker:
             params={"status": "open", "limit": 100, "direction": "desc"},
         )
 
+    async def get_recent_orders(
+        self,
+        *,
+        status: str = "closed",
+        limit: int = 100,
+        after: str | None = None,
+        until: str | None = None,
+    ) -> list[dict]:
+        params: dict[str, Any] = {
+            "status": status,
+            "limit": limit,
+            "direction": "desc",
+        }
+        if after:
+            params["after"] = after
+        if until:
+            params["until"] = until
+        return await self._request("GET", f"{self.trading_base_url}/v2/orders", params=params)
+
     async def _get_equity_snapshot(self, symbol: str) -> MarketSnapshot:
         latest = await self._request(
             "GET",
@@ -181,11 +200,13 @@ class AlpacaBroker:
         )
         price = float(latest["trade"]["p"])
         bars = await self._get_stock_bars([symbol])
+        closes, volumes = bars.get(symbol, ([], []))
         return MarketSnapshot(
             symbol=symbol,
             asset_class=AssetClass.EQUITY,
             price=price,
-            closes=bars.get(symbol, []),
+            closes=closes,
+            metadata={"volumes": volumes},
         )
 
     async def _get_crypto_snapshot(self, symbol: str) -> MarketSnapshot:
@@ -196,11 +217,13 @@ class AlpacaBroker:
         )
         price = float(latest["trades"][symbol]["p"])
         bars = await self._get_crypto_bars([symbol])
+        closes, volumes = bars.get(symbol, ([], []))
         return MarketSnapshot(
             symbol=symbol,
             asset_class=AssetClass.CRYPTO,
             price=price,
-            closes=bars.get(symbol, []),
+            closes=closes,
+            metadata={"volumes": volumes},
         )
 
     async def _get_option_snapshot(self, symbol: str) -> MarketSnapshot:
@@ -252,7 +275,7 @@ class AlpacaBroker:
             return float(bid)
         return None
 
-    async def _get_stock_bars(self, symbols: list[str]) -> dict[str, list[float]]:
+    async def _get_stock_bars(self, symbols: list[str]) -> dict[str, tuple[list[float], list[float]]]:
         start = (datetime.now(UTC) - timedelta(days=100)).isoformat()
         data = await self._request(
             "GET",
@@ -265,12 +288,9 @@ class AlpacaBroker:
                 "limit": 1000,
             },
         )
-        return {
-            symbol: [float(bar["c"]) for bar in bars]
-            for symbol, bars in data.get("bars", {}).items()
-        }
+        return self._bars_to_closes_and_volumes(data.get("bars", {}))
 
-    async def _get_crypto_bars(self, symbols: list[str]) -> dict[str, list[float]]:
+    async def _get_crypto_bars(self, symbols: list[str]) -> dict[str, tuple[list[float], list[float]]]:
         start = (datetime.now(UTC) - timedelta(days=100)).isoformat()
         data = await self._request(
             "GET",
@@ -282,12 +302,19 @@ class AlpacaBroker:
                 "limit": 1000,
             },
         )
-        return {
-            symbol: [float(bar["c"]) for bar in bars]
-            for symbol, bars in data.get("bars", {}).items()
-        }
+        return self._bars_to_closes_and_volumes(data.get("bars", {}))
 
-    def _asset_class_from_alpaca(self, value: str | None) -> AssetClass:
+    def _bars_to_closes_and_volumes(self, rows_by_symbol: dict) -> dict[str, tuple[list[float], list[float]]]:
+        parsed: dict[str, tuple[list[float], list[float]]] = {}
+        for symbol, bars in rows_by_symbol.items():
+            closes = [float(bar["c"]) for bar in bars]
+            volumes = [float(bar.get("v") or 0) for bar in bars]
+            parsed[symbol] = (closes, volumes)
+        return parsed
+
+    def _asset_class_from_alpaca(self, value: str | None, symbol: str = "") -> AssetClass:
+        if self._looks_like_option_symbol(symbol):
+            return AssetClass.OPTION
         if value == "crypto":
             return AssetClass.CRYPTO
         if value == "option":

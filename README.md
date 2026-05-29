@@ -88,15 +88,73 @@ The position manager checks:
 
 Exit candidates still pass through the risk engine before execution and are saved in the audit dashboard.
 
+## Crypto Research
+
+Crypto symbols such as `BTC/USD` and `ETH/USD` use a separate crypto research path. When enabled, the agent records:
+
+- crypto market regime and score
+- BTC and ETH dominance
+- total crypto market cap and volume
+- asset 24h/7d/30d performance
+- crypto fear/greed reading
+- stablecoin circulating supply snapshot
+- perpetual funding-rate snapshot for supported BTC/ETH pairs
+- explicit status for exchange-flow and on-chain feeds
+
+Configured in `config/settings.toml`:
+
+```toml
+[research]
+crypto_research_enabled = true
+crypto_onchain_enabled = false
+crypto_onchain_provider = ""
+crypto_exchange_flows_enabled = false
+```
+
+Exchange-flow and on-chain data are intentionally marked as not configured until a supported provider is added. The crypto momentum strategy uses the crypto regime and risk flags to adjust scores before creating entry candidates.
+
+## Market Screener
+
+By default, the agent uses the fixed `strategy.symbols` list. When the screener is enabled, it scans configured universes, filters for liquidity/trend/volatility, and passes only top candidates into the research and risk pipeline.
+
+```toml
+[screener]
+enabled = false
+max_candidates = 10
+max_crypto_candidates = 3
+universes = ["nasdaq100", "sp500_core", "crypto_major"]
+min_price = 5.0
+min_avg_dollar_volume = 25000000.0
+max_realized_volatility_pct = 90.0
+min_trend_score = 45.0
+```
+
+Use the screener for normal paper observation once you are comfortable with the system. Use the fixed `strategy.symbols` list when debugging, testing a small watchlist, or running your first live trials.
+
+Preview screener output without placing trades:
+
+```bash
+trading-agent screen
+```
+
 Useful audit commands:
 
 ```bash
 trading-agent audit-status
 trading-agent audit-backup
 trading-agent audit-export
+trading-agent broker-sync --days 30
 ```
 
-`audit-backup` creates a SQLite backup copy. `audit-export` writes a JSON review file.
+`audit-backup` creates a SQLite backup copy. `audit-export` writes a JSON review file. `broker-sync` is read-only against Alpaca and backfills closed broker orders into SQLite so the performance report can calculate realized P/L from fills.
+
+Start the local dashboard:
+
+```bash
+trading-agent dashboard
+```
+
+The dashboard includes trade decisions, orders, market snapshots, research, audit history, and a performance report with equity drawdown, win rate, open P/L, exit-signal P/L, and strategy-level assessment.
 
 ## Continuous Run On macOS
 
@@ -136,5 +194,22 @@ mode = "live"
 - Max stock/ETF position: 12% of equity
 - Max crypto position: 10% of equity
 - Max options premium per trade: 2% of equity
+
+## Cycle And Daily Order Caps
+
+The agent has separate paper/live loop intervals and daily order caps:
+
+```toml
+[agent]
+paper_cycle_seconds = 300
+live_cycle_seconds = 1800
+max_orders_per_cycle = 3
+paper_max_entry_orders_per_day = 12
+paper_max_total_orders_per_day = 24
+live_max_entry_orders_per_day = 3
+live_max_total_orders_per_day = 6
+```
+
+`max_orders_per_cycle` limits new entries per cycle. The daily caps limit submitted orders for the whole Central-time day. Exit orders count toward the total daily cap but not the daily entry cap.
 
 This software is not financial advice. It can lose money, especially if live trading is enabled.

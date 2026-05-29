@@ -3,10 +3,15 @@ provider = "alpaca"
 mode = "paper"
 
 [agent]
-cycle_seconds = 300
+paper_cycle_seconds = 300
+live_cycle_seconds = 1800
 run_on_weekends_for_crypto = true
 execute_orders = true
 max_orders_per_cycle = 3
+paper_max_entry_orders_per_day = 12
+paper_max_total_orders_per_day = 24
+live_max_entry_orders_per_day = 3
+live_max_total_orders_per_day = 6
 
 [audit]
 enabled = true
@@ -47,6 +52,20 @@ allow_crypto = true
 allow_short = true
 min_signal_score = 70.0
 
+[screener]
+enabled = true
+max_candidates = 10
+max_crypto_candidates = 3
+universes = ["nasdaq100", "sp500_core", "crypto_major"]
+min_price = 5.0
+min_avg_dollar_volume = 25000000.0
+max_realized_volatility_pct = 90.0
+min_trend_score = 45.0
+
 [research]
 news_headline_limit = 8
 sec_companyfacts_enabled = true
+crypto_research_enabled = true
+crypto_onchain_enabled = false
+crypto_onchain_provider = ""
+crypto_exchange_flows_enabled = false

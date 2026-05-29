@@ -17,3 +17,9 @@ def test_option_quote_bid_ask_accepts_verbose_keys() -> None:
     broker = AlpacaBroker.__new__(AlpacaBroker)
 
     assert broker.option_quote_bid_ask({"bid_price": 2.0, "ask_price": 2.5}) == (2.0, 2.5)
+
+
+def test_asset_class_detects_option_symbol_even_if_broker_reports_equity() -> None:
+    broker = AlpacaBroker.__new__(AlpacaBroker)
+
+    assert broker._asset_class_from_alpaca("equity", "AAPL260612C00322500").value == "option"

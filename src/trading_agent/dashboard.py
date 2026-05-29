@@ -46,6 +46,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 }
             )
             return
+        if parsed.path == "/api/performance":
+            self._send_json(self.server.store.performance_report())
+            return
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
     def log_message(self, format: str, *args) -> None:
@@ -221,6 +224,9 @@ DASHBOARD_HTML = r"""<!doctype html>
     .approved, .submitted, .completed { color: var(--ok); border-color: rgba(6, 118, 71, 0.35); }
     .rejected, .failed { color: var(--danger); border-color: rgba(180, 35, 24, 0.35); }
     .running, .generated, .captured { color: var(--warn); border-color: rgba(181, 71, 8, 0.35); }
+    .helping { color: var(--ok); border-color: rgba(6, 118, 71, 0.35); }
+    .hurting { color: var(--danger); border-color: rgba(180, 35, 24, 0.35); }
+    .neutral, .needs_data { color: var(--warn); border-color: rgba(181, 71, 8, 0.35); }
     .hidden { display: none; }
     .empty {
       background: var(--surface);
@@ -270,12 +276,14 @@ DASHBOARD_HTML = r"""<!doctype html>
     <nav class="tabs">
       <button class="tab active" data-tab="decisions">Trade Decisions</button>
       <button class="tab" data-tab="orders">Orders</button>
+      <button class="tab" data-tab="performance">Performance</button>
       <button class="tab" data-tab="market">Market</button>
       <button class="tab" data-tab="research">Research</button>
       <button class="tab" data-tab="audit">Audit History</button>
     </nav>
     <section id="decisions" class="panel"></section>
     <section id="orders" class="panel hidden"></section>
+    <section id="performance" class="panel hidden"></section>
     <section id="market" class="panel hidden"></section>
     <section id="research" class="panel hidden"></section>
     <section id="audit" class="panel hidden">
@@ -288,6 +296,7 @@ DASHBOARD_HTML = r"""<!doctype html>
             <option value="trade_candidate">Trade candidates</option>
             <option value="risk_decision">Risk decisions</option>
             <option value="order">Orders</option>
+            <option value="broker_order_update">Broker order updates</option>
             <option value="risk_stop">Risk stops</option>
           </select>
           <button id="reloadAudit">Refresh</button>
@@ -298,12 +307,20 @@ DASHBOARD_HTML = r"""<!doctype html>
     </section>
   </main>
   <script>
-    const state = { summary: null, auditEvents: [] };
+    const state = { summary: null, performance: null, auditEvents: [] };
     const currency = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 
     function fmtMoney(value) {
       const num = Number(value || 0);
       return currency.format(num);
+    }
+    function fmtSignedMoney(value) {
+      const num = Number(value || 0);
+      return `${num > 0 ? "+" : ""}${currency.format(num)}`;
+    }
+    function fmtPct(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "";
+      return `${Number(value).toFixed(2)}%`;
     }
     function fmtDate(value) {
       if (!value) return "";
@@ -406,6 +423,83 @@ DASHBOARD_HTML = r"""<!doctype html>
         { key: "time", label: "Time" },
       ], rows, "No submitted or rejected orders recorded yet.");
     }
+    function renderPerformance(report) {
+      const summary = report.summary || {};
+      const warnings = report.data_quality?.warnings || [];
+      const metricHtml = [
+        ["Total P/L", fmtSignedMoney(summary.total_pl)],
+        ["Max Drawdown", fmtPct(summary.max_drawdown_pct)],
+        ["Win Rate", fmtPct(summary.win_rate_pct)],
+        ["Realized P/L", fmtSignedMoney(summary.realized_pl)],
+        ["Open P/L", fmtSignedMoney(summary.open_unrealized_pl)],
+      ].map(([label, value]) => `<div class="metric"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join("");
+
+      const strategyRows = (report.strategies || []).map(row => ({
+        assessment: statusPill(row.assessment),
+        strategy: esc(row.strategy),
+        total: esc(fmtSignedMoney(row.total_pl_estimate)),
+        realized: esc(fmtSignedMoney(row.realized_pl)),
+        open: esc(fmtSignedMoney(row.open_unrealized_pl)),
+        exitSignal: esc(fmtSignedMoney(row.exit_signal_pl)),
+        winRate: esc(fmtPct(row.win_rate_pct)),
+        closed: esc(row.closed_trades),
+        exits: esc(row.exit_signals),
+        orders: esc(`${row.submitted_orders}/${row.rejected_orders}/${row.skipped_orders}`),
+      }));
+      const strategyHeaders = [
+        { key: "assessment", label: "Helping" },
+        { key: "strategy", label: "Strategy" },
+        { key: "total", label: "P/L Estimate", cls: "num" },
+        { key: "realized", label: "Realized", cls: "num" },
+        { key: "open", label: "Open", cls: "num" },
+        { key: "exitSignal", label: "Exit Signal", cls: "num" },
+        { key: "winRate", label: "Win Rate", cls: "num" },
+        { key: "closed", label: "Closed", cls: "num" },
+        { key: "exits", label: "Exit Signals", cls: "num" },
+        { key: "orders", label: "Submitted / Rejected / Skipped", cls: "num" },
+      ];
+
+      const positionRows = (report.open_positions || []).map(row => ({
+        symbol: esc(row.symbol),
+        strategy: esc(row.strategy),
+        assetClass: esc(row.asset_class),
+        qty: esc(row.qty),
+        marketValue: esc(fmtMoney(row.market_value)),
+        open: esc(fmtSignedMoney(row.unrealized_pl)),
+      }));
+      const recentCurve = (report.equity_curve || []).slice(-12).reverse().map(row => ({
+        cycle: esc(row.cycle_id),
+        time: esc(fmtDate(row.started_at)),
+        equity: esc(fmtMoney(row.equity)),
+        drawdown: esc(fmtPct(row.drawdown_pct)),
+      }));
+
+      document.getElementById("performance").innerHTML = `
+        <section class="metrics">${metricHtml}</section>
+        ${warnings.length ? `<div class="empty">${warnings.map(esc).join("<br>")}</div>` : ""}
+        <div class="toolbar"><div class="meta">Strategy performance</div><div class="meta">P/L estimate = realized + exit-signal + open P/L</div></div>
+        <div id="strategyPerformance"></div>
+        <div class="toolbar"><div class="meta">Open positions by strategy</div></div>
+        <div id="openPositionPerformance"></div>
+        <div class="toolbar"><div class="meta">Recent equity drawdown</div></div>
+        <div id="equityPerformance"></div>
+      `;
+      renderTable("strategyPerformance", strategyHeaders, strategyRows, "No strategy performance data yet.");
+      renderTable("openPositionPerformance", [
+        { key: "symbol", label: "Symbol" },
+        { key: "strategy", label: "Strategy" },
+        { key: "assetClass", label: "Class" },
+        { key: "qty", label: "Qty", cls: "num" },
+        { key: "marketValue", label: "Market Value", cls: "num" },
+        { key: "open", label: "Open P/L", cls: "num" },
+      ], positionRows, "No open positions recorded in the latest cycle.");
+      renderTable("equityPerformance", [
+        { key: "cycle", label: "Cycle", cls: "num" },
+        { key: "time", label: "Time" },
+        { key: "equity", label: "Equity", cls: "num" },
+        { key: "drawdown", label: "Drawdown", cls: "num" },
+      ], recentCurve, "No equity history recorded yet.");
+    }
     function renderMarket(summary) {
       const rows = (summary.market_snapshots || []).map(event => {
         const data = payload(event);
@@ -430,9 +524,12 @@ DASHBOARD_HTML = r"""<!doctype html>
         const data = payload(event);
         const filings = data.sec_summary?.recent_filings || [];
         const latestFiling = filings[0] ? `${filings[0].form} ${filings[0].filing_date}` : "";
+        const regime = data.crypto_summary?.regime;
+        const cryptoText = regime ? `${regime.label} ${regime.score}` : "";
         return {
           symbol: esc(event.symbol),
           entity: esc(data.sec_summary?.entity_name || ""),
+          crypto: esc(cryptoText),
           headlines: esc((data.news || []).length),
           filing: esc(latestFiling),
           notes: `<div class="detail">${esc((data.notes || []).join(" | "))}</div>`,
@@ -441,6 +538,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       renderTable("research", [
         { key: "symbol", label: "Symbol" },
         { key: "entity", label: "Entity" },
+        { key: "crypto", label: "Crypto Regime" },
         { key: "headlines", label: "Headlines", cls: "num" },
         { key: "filing", label: "Latest Filing" },
         { key: "notes", label: "Notes" },
@@ -484,6 +582,11 @@ DASHBOARD_HTML = r"""<!doctype html>
         { key: "payload", label: "Payload" },
       ], rows, "No audit events recorded yet.");
     }
+    async function loadPerformance() {
+      const response = await fetch("/api/performance", { cache: "no-store" });
+      state.performance = await response.json();
+      renderPerformance(state.performance);
+    }
     document.querySelectorAll(".tab").forEach(tab => {
       tab.addEventListener("click", () => {
         document.querySelectorAll(".tab").forEach(item => item.classList.remove("active"));
@@ -491,6 +594,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         tab.classList.add("active");
         document.getElementById(tab.dataset.tab).classList.remove("hidden");
         if (tab.dataset.tab === "audit") loadAudit();
+        if (tab.dataset.tab === "performance") loadPerformance();
       });
     });
     document.getElementById("reloadAudit").addEventListener("click", loadAudit);
@@ -500,6 +604,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     });
     setInterval(() => {
       loadSummary();
+      if (!document.getElementById("performance").classList.contains("hidden")) loadPerformance();
       if (!document.getElementById("audit").classList.contains("hidden")) loadAudit();
     }, 10000);
   </script>

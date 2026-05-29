@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 from trading_agent.audit import AuditStore
 from trading_agent.config import Settings
-from trading_agent.models import AssetClass, Position
+from trading_agent.models import AssetClass, OrderSide, Position
 from trading_agent.position_manager import PositionManager
 
 
@@ -102,3 +102,25 @@ def test_position_manager_creates_time_exit(tmp_path) -> None:
 
     assert len(candidates) == 1
     assert candidates[0].strategy == "time_exit"
+
+
+def test_position_manager_creates_short_option_stop_loss_exit() -> None:
+    manager = PositionManager(Settings())
+
+    candidates = manager.evaluate(
+        [
+            Position(
+                symbol="AAPL260612C00322500",
+                asset_class=AssetClass.OPTION,
+                qty=-1,
+                market_value=-225,
+                avg_entry_price=1.0,
+                current_price=2.25,
+                unrealized_pl=-125,
+            )
+        ]
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].side == OrderSide.BUY
+    assert candidates[0].strategy == "short_option_stop_loss_exit"

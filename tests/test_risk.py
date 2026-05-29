@@ -199,3 +199,35 @@ def test_exit_candidate_uses_existing_position_quantity() -> None:
     assert decision.intent.side == OrderSide.SELL
     assert decision.intent.qty == 10
     assert decision.reason == "Approved position exit."
+
+
+def test_option_exit_uses_limit_order() -> None:
+    settings = Settings()
+    engine = RiskEngine(settings)
+    decision = engine.evaluate(
+        TradeCandidate(
+            symbol="AAPL260612C00322500",
+            asset_class=AssetClass.OPTION,
+            side=OrderSide.BUY,
+            strategy="short_option_stop_loss_exit",
+            score=100,
+            entry_price=2.25,
+            metadata={"exit": True, "exit_qty": 1},
+        ),
+        AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000, last_equity=100_000),
+        [
+            Position(
+                symbol="AAPL260612C00322500",
+                asset_class=AssetClass.OPTION,
+                qty=-1,
+                market_value=-225,
+                avg_entry_price=1.91,
+            )
+        ],
+    )
+
+    assert decision.approved
+    assert decision.intent is not None
+    assert decision.intent.side == OrderSide.BUY
+    assert decision.intent.order_type.value == "limit"
+    assert decision.intent.limit_price == 2.25
