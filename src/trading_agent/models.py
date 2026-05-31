@@ -22,6 +22,7 @@ class OrderSide(StrEnum):
 class OrderType(StrEnum):
     MARKET = "market"
     LIMIT = "limit"
+    STOP = "stop"
     STOP_LIMIT = "stop_limit"
 
 

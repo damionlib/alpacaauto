@@ -305,6 +305,31 @@ class AuditStore:
             ).fetchone()
         return self._event_row(row) if row else None
 
+    def protective_parent_for(self, protective_client_order_id: str) -> str | None:
+        if not protective_client_order_id:
+            return None
+        pattern = f'%"client_order_id": "{protective_client_order_id}"%'
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                select payload_json
+                from audit_events
+                where event_type = 'order'
+                  and strategy = 'crypto_protective_stop'
+                  and payload_json like ?
+                order by id desc
+                limit 1
+                """,
+                (pattern,),
+            ).fetchone()
+        if not row:
+            return None
+        payload = self._loads(row["payload_json"]) or {}
+        intent = payload.get("intent") or {}
+        metadata = intent.get("metadata") or {}
+        parent = metadata.get("parent_client_order_id")
+        return str(parent) if parent else None
+
     def crypto_protective_stop_exists(self, parent_client_order_id: str) -> bool:
         pattern = f'%"parent_client_order_id": "{parent_client_order_id}"%'
         with self._connect() as connection:

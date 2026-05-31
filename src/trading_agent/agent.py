@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections import defaultdict
 from collections.abc import Iterable
 from datetime import datetime
 
@@ -28,6 +29,24 @@ from trading_agent.risk import RiskEngine
 from trading_agent.screener.service import MarketScreener
 from trading_agent.strategies.momentum import MomentumStrategy
 from trading_agent.strategies.options import OptionsStrategy
+
+
+# Substrings that mark a broker rejection as a holding/quantity conflict — i.e. a
+# resting order is reserving the shares/qty an exit needs. Only these justify
+# canceling resting (protective) orders and retrying the exit. Anything else
+# (transient network/5xx, validation, account-not-eligible) must NOT strip
+# protection. We deliberately match on message text, not Alpaca numeric codes:
+# code 40310000 is a generic 403 reused for unrelated cases like "account not
+# eligible to trade options", so it is not a reliable conflict signal.
+_CONFLICT_ERROR_SIGNALS = (
+    "insufficient qty",
+    "insufficient balance",
+    "qty available",
+    "held for orders",
+    "wash trade",
+    "potential wash",
+    "not enough",
+)
 
 
 class TradingAgent:
@@ -83,14 +102,14 @@ class TradingAgent:
             self._print_decisions(account, decisions)
 
             if self.settings.agent.execute_orders:
-                await self._submit_decisions(decisions, account, cycle_id)
+                await self._submit_decisions(decisions, account, cycle_id, positions)
                 await self._sync_recent_order_updates(cycle_id)
             if self.audit and cycle_id:
                 self.audit.finish_cycle(cycle_id, status="stopped" if halt_entries else "completed")
             return decisions
         except Exception as exc:
             if self.audit and cycle_id:
-                self.audit.finish_cycle(cycle_id, status="failed", error=str(exc))
+                self.audit.finish_cycle(cycle_id, status="failed", error=str(exc) or repr(exc))
             raise
 
     async def loop(self) -> None:
@@ -177,6 +196,7 @@ class TradingAgent:
         decisions: list[RiskDecision],
         account,
         cycle_id: int | None,
+        positions: list[Position] | None = None,
     ) -> None:
         open_orders = await self._open_order_reservations()
         daily_counts = self._daily_order_counts()
@@ -228,7 +248,7 @@ class TradingAgent:
                 )
                 continue
             if not is_exit:
-                skip_reason = self._skip_due_to_open_orders(decision, open_orders)
+                skip_reason = self._skip_due_to_open_orders(decision, open_orders, positions)
                 if skip_reason:
                     self.console.print(f"[yellow]order skipped[/yellow] {decision.intent.symbol}: {skip_reason}")
                     self._audit_event(
@@ -260,31 +280,33 @@ class TradingAgent:
                 )
                 continue
             order = None
+            submit_error: Exception | None = None
             try:
                 order = await self.broker.submit_order(decision.intent)
             except Exception as exc:
-                canceled_for_retry = (
-                    await self._cancel_conflicting_open_orders(decision, open_orders, cycle_id)
-                    if is_exit
-                    else 0
-                )
-                if canceled_for_retry:
-                    try:
-                        order = await self.broker.submit_order(decision.intent)
-                    except Exception as retry_exc:
-                        exc = retry_exc
-                if order is None:
-                    self.console.print(f"[red]order rejected[/red] {decision.intent.symbol}: {exc}")
-                    self._audit_event(
-                        cycle_id,
-                        "order",
-                        {"intent": decision.intent, "error": str(exc)},
-                        symbol=decision.intent.symbol,
-                        strategy=decision.candidate.strategy,
-                        status="rejected",
-                        reason=str(exc),
+                submit_error = exc
+                # An exit may clear resting orders to get filled, but only when the
+                # rejection is a genuine holding/qty conflict. For transient or
+                # unrelated errors we leave protective orders untouched and let the
+                # position manager retry the exit on the next cycle.
+                if is_exit and self._is_conflict_error(exc):
+                    order, submit_error = await self._retry_exit_after_clearing_conflicts(
+                        decision, open_orders, cycle_id, exc
                     )
-                    continue
+            if order is None:
+                self.console.print(
+                    f"[red]order rejected[/red] {decision.intent.symbol}: {submit_error}"
+                )
+                self._audit_event(
+                    cycle_id,
+                    "order",
+                    {"intent": decision.intent, "error": str(submit_error)},
+                    symbol=decision.intent.symbol,
+                    strategy=decision.candidate.strategy,
+                    status="rejected",
+                    reason=str(submit_error),
+                )
+                continue
             if is_exit:
                 await self._cancel_conflicting_open_orders(decision, open_orders, cycle_id)
             remaining_cash = max(remaining_cash - cash_required, 0.0)
@@ -337,13 +359,13 @@ class TradingAgent:
         decision: RiskDecision,
         open_orders: dict,
         cycle_id: int | None,
-    ) -> int:
+    ) -> list[dict]:
         if not decision.intent:
-            return 0
+            return []
         symbol = decision.intent.symbol
         if symbol not in open_orders["symbols"]:
-            return 0
-        canceled = 0
+            return []
+        canceled: list[dict] = []
         for order in open_orders["orders"]:
             if str(order.get("symbol") or "") != symbol:
                 continue
@@ -355,7 +377,7 @@ class TradingAgent:
             except Exception as exc:
                 self.console.print(f"[yellow]could not cancel resting order[/yellow] {order_id}: {exc}")
                 continue
-            canceled += 1
+            canceled.append(order)
             self._audit_event(
                 cycle_id,
                 "order",
@@ -367,6 +389,230 @@ class TradingAgent:
             )
         open_orders["symbols"].discard(symbol)
         return canceled
+
+    def _is_conflict_error(self, exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(signal in text for signal in _CONFLICT_ERROR_SIGNALS)
+
+    async def _retry_exit_after_clearing_conflicts(
+        self,
+        decision: RiskDecision,
+        open_orders: dict,
+        cycle_id: int | None,
+        original_exc: Exception,
+    ) -> tuple[dict | None, Exception | None]:
+        canceled = await self._cancel_conflicting_open_orders(decision, open_orders, cycle_id)
+        if not canceled:
+            return None, original_exc
+        try:
+            order = await self.broker.submit_order(decision.intent)
+        except Exception as retry_exc:
+            # The exit still failed after we cleared protection. Put the canceled
+            # orders back so the position is not left unguarded; the position
+            # manager will attempt the exit again next cycle.
+            await self._rearm_orders(canceled, cycle_id)
+            return None, retry_exc
+        return order, None
+
+    async def _rearm_orders(self, canceled: list[dict], cycle_id: int | None) -> None:
+        # Only restore protective (position-reducing) resting orders. Re-arming an
+        # unfilled entry would re-add risk, so non-protective canceled orders are
+        # left alone.
+        protective = [order for order in canceled if self._is_protective_order(order)]
+        restored: set[str] = set()
+        for order in protective:
+            symbol = str(order.get("symbol") or "")
+            if "/" in symbol and await self._rearm_crypto_protective(order, cycle_id):
+                restored.add(symbol)
+        # Equity bracket leaves two protective legs (a stop and a take-profit).
+        # Rebuild them as a single OCO so they cannot both fill and oversell.
+        equity_legs: dict[str, list[dict]] = defaultdict(list)
+        for order in protective:
+            symbol = str(order.get("symbol") or "")
+            if "/" not in symbol:
+                equity_legs[symbol].append(order)
+        for symbol, legs in equity_legs.items():
+            if await self._rearm_equity_protection(symbol, legs, cycle_id):
+                restored.add(symbol)
+        for order in protective:
+            if str(order.get("symbol") or "") not in restored:
+                self._warn_unprotected(order, cycle_id)
+
+    def _is_protective_order(self, order: dict) -> bool:
+        if "protect" in str(order.get("client_order_id") or ""):
+            return True
+        position_intent = str(order.get("position_intent") or "")
+        if position_intent.endswith("_to_open"):
+            return False
+        side = str(order.get("side") or "")
+        order_type = str(order.get("type") or order.get("order_type") or "").lower()
+        # A resting sell stop/limit on a held long is a bracket protective leg.
+        return side == "sell" and order_type in {"stop", "stop_limit", "limit"}
+
+    async def _rearm_equity_protection(
+        self,
+        symbol: str,
+        legs: list[dict],
+        cycle_id: int | None,
+    ) -> bool:
+        stop_price: float | None = None
+        take_profit_price: float | None = None
+        qty: float | None = None
+        for leg in legs:
+            leg_type = str(leg.get("type") or leg.get("order_type") or "").lower()
+            leg_qty = self._coerce_float(leg.get("qty"))
+            if leg_qty and leg_qty > 0:
+                qty = leg_qty if qty is None else max(qty, leg_qty)
+            leg_stop = self._coerce_float(leg.get("stop_price"))
+            if leg_stop and leg_stop > 0:
+                stop_price = leg_stop
+            if leg_type == "limit":
+                leg_limit = self._coerce_float(leg.get("limit_price"))
+                if leg_limit and leg_limit > 0:
+                    take_profit_price = leg_limit
+        protective = self._equity_protection_intent(symbol, qty, stop_price, take_profit_price)
+        if protective is None:
+            return False
+        try:
+            protect_order = await self.broker.submit_order(protective)
+        except Exception as exc:
+            self.console.print(f"[yellow]equity protection not restored[/yellow] {symbol}: {exc}")
+            self._audit_event(
+                cycle_id,
+                "order",
+                {"intent": protective, "error": str(exc)},
+                symbol=symbol,
+                strategy="equity_protective_exit",
+                status="unprotected",
+                reason=f"Could not restore bracket protection after a failed exit retry: {exc}",
+            )
+            return False
+        self._audit_event(
+            cycle_id,
+            "order",
+            {"intent": protective, "broker_order": protect_order},
+            symbol=symbol,
+            strategy="equity_protective_exit",
+            status="submitted",
+            reason="Restored bracket protection (OCO) after the exit retry failed.",
+        )
+        self.console.print(f"[green]bracket protection restored[/green] {symbol}")
+        return True
+
+    def _equity_protection_intent(
+        self,
+        symbol: str,
+        qty: float | None,
+        stop_price: float | None,
+        take_profit_price: float | None,
+    ) -> OrderIntent | None:
+        if not qty or qty < 1:
+            return None
+        qty_int = int(qty)
+        if qty_int < 1:
+            return None
+        client_order_id = f"ta-equity-protect-{uuid.uuid4().hex[:12]}"
+        metadata = {"protective_stop": True, "parent_symbol": symbol}
+        if stop_price is not None and take_profit_price is not None:
+            return OrderIntent(
+                symbol=symbol,
+                asset_class=AssetClass.EQUITY,
+                side=OrderSide.SELL,
+                qty=qty_int,
+                order_type=OrderType.LIMIT,
+                time_in_force=TimeInForce.GTC,
+                order_class="oco",
+                stop_loss_price=round(stop_price, 2),
+                take_profit_price=round(take_profit_price, 2),
+                client_order_id=client_order_id,
+                metadata=metadata,
+            )
+        if stop_price is not None:
+            return OrderIntent(
+                symbol=symbol,
+                asset_class=AssetClass.EQUITY,
+                side=OrderSide.SELL,
+                qty=qty_int,
+                order_type=OrderType.STOP,
+                time_in_force=TimeInForce.GTC,
+                stop_price=round(stop_price, 2),
+                client_order_id=client_order_id,
+                metadata=metadata,
+            )
+        if take_profit_price is not None:
+            return OrderIntent(
+                symbol=symbol,
+                asset_class=AssetClass.EQUITY,
+                side=OrderSide.SELL,
+                qty=qty_int,
+                order_type=OrderType.LIMIT,
+                time_in_force=TimeInForce.GTC,
+                limit_price=round(take_profit_price, 2),
+                client_order_id=client_order_id,
+                metadata=metadata,
+            )
+        return None
+
+    def _warn_unprotected(self, order: dict, cycle_id: int | None) -> None:
+        symbol = str(order.get("symbol") or "")
+        self.console.print(
+            f"[red]protection not restored[/red] {symbol}: exit retry failed and the "
+            "resting order could not be auto-replaced"
+        )
+        self._audit_event(
+            cycle_id,
+            "order",
+            {"canceled_order": order},
+            symbol=symbol,
+            strategy=self._strategy_from_order(order),
+            status="unprotected",
+            reason=(
+                "Exit retry failed after canceling this resting order and it could not be "
+                "auto-restored; the position manager will retry the exit next cycle."
+            ),
+        )
+
+    async def _rearm_crypto_protective(self, order: dict, cycle_id: int | None) -> bool:
+        symbol = str(order.get("symbol") or "")
+        qty = self._coerce_float(order.get("qty"))
+        stop_price = self._coerce_float(order.get("stop_price"))
+        if not symbol or not qty or qty <= 0 or not stop_price or stop_price <= 0:
+            return False
+        parent = None
+        if self.audit:
+            parent = self.audit.protective_parent_for(str(order.get("client_order_id") or ""))
+        protective = self._crypto_protective_intent(symbol, qty, stop_price, parent)
+        try:
+            protect_order = await self.broker.submit_order(protective)
+        except Exception as exc:
+            self.console.print(f"[yellow]crypto protective stop not restored[/yellow] {symbol}: {exc}")
+            self._audit_event(
+                cycle_id,
+                "order",
+                {"intent": protective, "error": str(exc)},
+                symbol=symbol,
+                strategy="crypto_protective_stop",
+                status="unprotected",
+                reason=f"Could not restore protective stop after a failed exit retry: {exc}",
+            )
+            return False
+        self._audit_event(
+            cycle_id,
+            "order",
+            {"intent": protective, "broker_order": protect_order},
+            symbol=symbol,
+            strategy="crypto_protective_stop",
+            status="submitted",
+            reason="Restored protective stop after the exit retry failed.",
+        )
+        self.console.print(f"[green]protective stop restored[/green] {symbol} @ {stop_price:.2f}")
+        return True
+
+    def _coerce_float(self, value) -> float | None:
+        try:
+            return float(value) if value not in {None, ""} else None
+        except (TypeError, ValueError):
+            return None
 
     async def _cancel_opening_orders_for_halt(self, cycle_id: int | None) -> None:
         try:
@@ -680,7 +926,12 @@ class TradingAgent:
             "orders": open_orders,
         }
 
-    def _skip_due_to_open_orders(self, decision: RiskDecision, open_orders: dict) -> str | None:
+    def _skip_due_to_open_orders(
+        self,
+        decision: RiskDecision,
+        open_orders: dict,
+        positions: list[Position] | None = None,
+    ) -> str | None:
         if not decision.intent:
             return None
         if decision.intent.symbol in open_orders["symbols"]:
@@ -692,12 +943,32 @@ class TradingAgent:
         contracts_per_100_shares = int(decision.candidate.metadata.get("contracts_per_100_shares") or 0)
         already_reserved = open_orders["covered_call_contracts_by_underlying"].get(underlying, 0)
         requested = int(decision.intent.qty or 0)
-        if already_reserved + requested > contracts_per_100_shares:
-            return (
+        # Shares are committed both by covered calls already written (filled short
+        # positions) and by covered-call orders still working. Count both so the
+        # agent never submits an order that would overrun the underlying coverage.
+        already_written = self._short_call_contracts(underlying, positions or [])
+        if already_reserved + requested + already_written > contracts_per_100_shares:
+            message = (
                 f"Open covered-call orders already reserve {already_reserved * 100} "
                 f"of {contracts_per_100_shares * 100} available {underlying} shares."
             )
+            if already_written:
+                message += f" {already_written} call(s) already written against this underlying."
+            return message
         return None
+
+    def _short_call_contracts(self, underlying: str, positions: list[Position]) -> int:
+        underlying = str(underlying or "")
+        if not underlying or not positions:
+            return 0
+        total = 0
+        for position in positions:
+            if position.asset_class != AssetClass.OPTION or position.qty >= 0:
+                continue
+            parsed = self._parse_option_symbol(position.symbol)
+            if parsed and parsed["underlying"] == underlying and parsed["type"] == "C":
+                total += int(abs(position.qty))
+        return total
 
     def _parse_option_symbol(self, symbol: str) -> dict | None:
         # OCC-style symbols here look like AAPL260612C00322500.

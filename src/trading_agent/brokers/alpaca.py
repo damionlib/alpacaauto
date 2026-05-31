@@ -157,7 +157,13 @@ class AlpacaBroker:
         if intent.client_order_id:
             payload["client_order_id"] = intent.client_order_id
 
-        if intent.asset_class in {AssetClass.EQUITY, AssetClass.ETF}:
+        if intent.order_class == "oco":
+            payload["order_class"] = "oco"
+            if intent.take_profit_price is not None:
+                payload["take_profit"] = {"limit_price": round(intent.take_profit_price, 2)}
+            if intent.stop_loss_price is not None:
+                payload["stop_loss"] = {"stop_price": round(intent.stop_loss_price, 2)}
+        elif intent.asset_class in {AssetClass.EQUITY, AssetClass.ETF}:
             if intent.stop_loss_price and intent.take_profit_price:
                 payload["order_class"] = "bracket"
                 payload["stop_loss"] = {"stop_price": round(intent.stop_loss_price, 2)}

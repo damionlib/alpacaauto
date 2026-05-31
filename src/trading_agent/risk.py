@@ -165,12 +165,22 @@ class RiskEngine:
         contract = candidate.metadata.get("contract", {})
         strategy = candidate.strategy
         if strategy == "covered_call":
-            underlying = candidate.metadata.get("underlying")
-            owned = self._position_qty(str(underlying), positions)
-            contracts = int(owned // 100)
-            if contracts < 1:
+            underlying = str(candidate.metadata.get("underlying") or "")
+            owned = self._position_qty(underlying, positions)
+            coverable_contracts = int(owned // 100)
+            if coverable_contracts < 1:
                 return self._reject(candidate, "Covered call requires 100 underlying shares per contract.")
-            return self._approve_option(candidate, min(contracts, 1), OrderType.LIMIT)
+            # Shares already committed to calls we have written cannot back another
+            # contract. Writing past that coverage would create a (partially) naked
+            # short call, which the broker rejects as "not eligible".
+            already_written = self._short_call_contracts(underlying, positions)
+            if coverable_contracts - already_written < 1:
+                return self._reject(
+                    candidate,
+                    f"Covered-call coverage already used: {already_written} call(s) written against "
+                    f"{coverable_contracts * 100} coverable {underlying} shares.",
+                )
+            return self._approve_option(candidate, 1, OrderType.LIMIT)
 
         strike = float(contract.get("strike_price", 0) or 0)
         if strategy == "cash_secured_put":
@@ -254,8 +264,32 @@ class RiskEngine:
                 return position.qty
         return 0.0
 
+    def _short_call_contracts(self, underlying: str, positions: list[Position]) -> int:
+        total = 0
+        for position in positions:
+            if position.asset_class != AssetClass.OPTION or position.qty >= 0:
+                continue
+            parsed = _occ_underlying_and_type(position.symbol)
+            if parsed and parsed[0] == underlying and parsed[1] == "C":
+                total += int(abs(position.qty))
+        return total
+
     def _client_order_id(self, candidate: TradeCandidate) -> str:
         return f"ta-{candidate.strategy}-{uuid.uuid4().hex[:16]}"
 
     def _reject(self, candidate: TradeCandidate, reason: str) -> RiskDecision:
         return RiskDecision(approved=False, reason=reason, candidate=candidate)
+
+
+def _occ_underlying_and_type(symbol: str) -> tuple[str, str] | None:
+    # OCC-style symbols look like AAPL260612C00322500: <root><yymmdd><C|P><strike>.
+    for index, char in enumerate(symbol):
+        if char.isdigit():
+            if len(symbol) < index + 15:
+                return None
+            date_part = symbol[index : index + 6]
+            option_type = symbol[index + 6 : index + 7]
+            if not date_part.isdigit() or option_type not in {"C", "P"}:
+                return None
+            return symbol[:index], option_type
+    return None

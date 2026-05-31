@@ -424,3 +424,179 @@ async def test_daily_loss_stop_manages_exits_without_canceling_all() -> None:
     assert len(broker.submitted) == 1
     assert broker.submitted[0].side == OrderSide.SELL
     assert any(decision.candidate.metadata.get("exit") for decision in decisions)
+
+
+# --- exit retry path: conflict-gated cancel + re-arm on retry failure -------------
+
+
+class ScriptedBroker(FakeBroker):
+    """FakeBroker whose submit_order can raise a scripted sequence of errors."""
+
+    def __init__(self, *, submit_outcomes=None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._submit_outcomes = list(submit_outcomes or [])
+
+    async def submit_order(self, intent: OrderIntent):
+        if self._submit_outcomes:
+            outcome = self._submit_outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                self.calls.append(f"submit-fail:{intent.symbol}")
+                raise outcome
+        return await super().submit_order(intent)
+
+
+def _crypto_exit_decision(symbol: str = "BTC/USD", qty: float = 2.0) -> RiskDecision:
+    candidate = TradeCandidate(
+        symbol=symbol,
+        asset_class=AssetClass.CRYPTO,
+        side=OrderSide.SELL,
+        strategy="stop_loss_exit",
+        score=100,
+        entry_price=90,
+        metadata={"exit": True, "exit_qty": qty},
+    )
+    intent = OrderIntent(
+        symbol=symbol,
+        asset_class=AssetClass.CRYPTO,
+        side=OrderSide.SELL,
+        qty=qty,
+        order_type=OrderType.MARKET,
+        time_in_force=TimeInForce.GTC,
+        metadata=candidate.metadata,
+    )
+    return RiskDecision(approved=True, reason="exit", intent=intent, candidate=candidate)
+
+
+_CONFLICT = RuntimeError("POST /v2/orders failed with 403: 40310000: insufficient qty available")
+_TRANSIENT = RuntimeError("POST /v2/orders failed with 503: service temporarily unavailable")
+
+
+@pytest.mark.anyio
+async def test_exit_conflict_error_cancels_then_retries_successfully() -> None:
+    broker = ScriptedBroker(
+        open_orders=[{"id": "x1", "symbol": "AAPL", "side": "sell", "qty": "10"}],
+        submit_outcomes=[_CONFLICT],  # first exit submit fails on a qty conflict
+    )
+    agent = _agent(broker)
+    account = AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000, last_equity=100_000)
+
+    await agent._submit_decisions([_exit_decision("AAPL", qty=10)], account, None)
+
+    # Conflict -> cancel resting order -> retry -> success.
+    assert broker.canceled == ["x1"]
+    assert broker.calls == ["submit-fail:AAPL", "cancel:x1", "submit:AAPL"]
+    assert len(broker.submitted) == 1
+    assert broker.cancel_all_called is False
+
+
+@pytest.mark.anyio
+async def test_exit_transient_error_preserves_protective_orders() -> None:
+    broker = ScriptedBroker(
+        open_orders=[{"id": "x1", "symbol": "AAPL", "side": "sell", "qty": "10"}],
+        submit_outcomes=[_TRANSIENT],  # not a conflict -> must NOT cancel anything
+    )
+    agent = _agent(broker)
+    account = AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000, last_equity=100_000)
+
+    await agent._submit_decisions([_exit_decision("AAPL", qty=10)], account, None)
+
+    # Protective/resting order is left in place; nothing was canceled or submitted.
+    assert broker.canceled == []
+    assert broker.submitted == []
+    assert broker.calls == ["submit-fail:AAPL"]
+    assert broker.cancel_all_called is False
+
+
+@pytest.mark.anyio
+async def test_exit_retry_failure_rearms_crypto_protective_stop() -> None:
+    protective = {
+        "id": "p1",
+        "symbol": "BTC/USD",
+        "side": "sell",
+        "type": "stop_limit",
+        "qty": "2",
+        "stop_price": "95",
+        "client_order_id": "ta-crypto-protect-abc",
+    }
+    broker = ScriptedBroker(
+        open_orders=[protective],
+        submit_outcomes=[_CONFLICT, _CONFLICT],  # exit fails, retry fails too
+    )
+    agent = _agent(broker)
+    account = AccountSnapshot(equity=100_000, cash=100_000, buying_power=100_000, last_equity=100_000)
+
+    await agent._submit_decisions([_crypto_exit_decision("BTC/USD", qty=2.0)], account, None)
+
+    # The protective stop was canceled for the retry, then restored after it failed.
+    assert broker.canceled == ["p1"]
+    assert broker.calls == ["submit-fail:BTC/USD", "cancel:p1", "submit-fail:BTC/USD", "submit:BTC/USD"]
+    assert len(broker.submitted) == 1
+    restored = broker.submitted[0]
+    assert restored.order_type == OrderType.STOP_LIMIT
+    assert restored.side == OrderSide.SELL
+    assert restored.qty == 2.0
+    assert restored.stop_price == 95
+
+
+@pytest.mark.anyio
+async def test_exit_retry_failure_rearms_equity_bracket_as_oco() -> None:
+    stop_leg = {
+        "id": "sl",
+        "symbol": "AAPL",
+        "side": "sell",
+        "type": "stop",
+        "qty": "10",
+        "stop_price": "94",
+    }
+    take_profit_leg = {
+        "id": "tp",
+        "symbol": "AAPL",
+        "side": "sell",
+        "type": "limit",
+        "qty": "10",
+        "limit_price": "112",
+    }
+    broker = ScriptedBroker(
+        open_orders=[stop_leg, take_profit_leg],
+        submit_outcomes=[_CONFLICT, _CONFLICT],  # exit fails, retry fails too
+    )
+    agent = _agent(broker)
+    account = AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000, last_equity=100_000)
+
+    await agent._submit_decisions([_exit_decision("AAPL", qty=10)], account, None)
+
+    # Both bracket legs were canceled for the retry, then rebuilt as one OCO.
+    assert broker.canceled == ["sl", "tp"]
+    assert len(broker.submitted) == 1
+    restored = broker.submitted[0]
+    assert restored.order_class == "oco"
+    assert restored.side == OrderSide.SELL
+    assert restored.qty == 10
+    assert restored.stop_loss_price == 94
+    assert restored.take_profit_price == 112
+
+
+@pytest.mark.anyio
+async def test_exit_retry_does_not_rearm_unfilled_entry_order() -> None:
+    # A resting BUY entry on the same symbol must not be "restored" as protection.
+    entry_order = {
+        "id": "e1",
+        "symbol": "AAPL",
+        "side": "buy",
+        "type": "limit",
+        "qty": "5",
+        "limit_price": "101",
+        "client_order_id": "ta-equity_momentum-xyz",
+        "position_intent": "buy_to_open",
+    }
+    broker = ScriptedBroker(
+        open_orders=[entry_order],
+        submit_outcomes=[_CONFLICT, _CONFLICT],
+    )
+    agent = _agent(broker)
+    account = AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000, last_equity=100_000)
+
+    await agent._submit_decisions([_exit_decision("AAPL", qty=10)], account, None)
+
+    assert broker.canceled == ["e1"]  # canceled to clear the conflict
+    assert broker.submitted == []  # but NOT re-armed as protection

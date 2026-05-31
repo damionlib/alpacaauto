@@ -231,3 +231,56 @@ def test_option_exit_uses_limit_order() -> None:
     assert decision.intent.side == OrderSide.BUY
     assert decision.intent.order_type.value == "limit"
     assert decision.intent.limit_price == 2.25
+
+
+def _covered_call_candidate(symbol: str, strike: str) -> TradeCandidate:
+    return TradeCandidate(
+        symbol=symbol,
+        asset_class=AssetClass.OPTION,
+        side=OrderSide.SELL,
+        strategy="covered_call",
+        score=72,
+        entry_price=1.9,
+        metadata={"underlying": "AAPL", "contract": {"strike_price": strike}},
+    )
+
+
+def test_covered_call_rejected_when_coverage_used_by_existing_short_calls() -> None:
+    engine = RiskEngine(Settings())
+    # 228 shares cover 2 contracts, but 2 calls are already written -> no coverage left.
+    decision = engine.evaluate(
+        _covered_call_candidate("AAPL260612C00322500", "322.5"),
+        AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000, last_equity=100_000),
+        [
+            Position(symbol="AAPL", asset_class=AssetClass.EQUITY, qty=228, market_value=72_000),
+            Position(
+                symbol="AAPL260612C00322500",
+                asset_class=AssetClass.OPTION,
+                qty=-2,
+                market_value=-368,
+            ),
+        ],
+    )
+    assert not decision.approved
+    assert "coverage" in decision.reason.lower()
+
+
+def test_covered_call_approved_when_uncovered_shares_remain() -> None:
+    engine = RiskEngine(Settings())
+    # 228 shares cover 2 contracts, only 1 written -> room for one more.
+    decision = engine.evaluate(
+        _covered_call_candidate("AAPL260612C00330000", "330"),
+        AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000, last_equity=100_000),
+        [
+            Position(symbol="AAPL", asset_class=AssetClass.EQUITY, qty=228, market_value=72_000),
+            Position(
+                symbol="AAPL260612C00322500",
+                asset_class=AssetClass.OPTION,
+                qty=-1,
+                market_value=-184,
+            ),
+        ],
+    )
+    assert decision.approved
+    assert decision.intent is not None
+    assert decision.intent.qty == 1
