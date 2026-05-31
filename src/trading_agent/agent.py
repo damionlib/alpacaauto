@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import Iterable
 from datetime import datetime
 
@@ -11,7 +12,16 @@ from trading_agent.audit import AuditStore, start_of_trading_day
 from trading_agent.broker_sync import BrokerOrderSync
 from trading_agent.brokers.alpaca import AlpacaBroker
 from trading_agent.config import Settings
-from trading_agent.models import AssetClass, Position, RiskDecision, TradeCandidate
+from trading_agent.models import (
+    AssetClass,
+    OrderIntent,
+    OrderSide,
+    OrderType,
+    Position,
+    RiskDecision,
+    TimeInForce,
+    TradeCandidate,
+)
 from trading_agent.position_manager import PositionManager
 from trading_agent.research.service import ResearchService
 from trading_agent.risk import RiskEngine
@@ -38,9 +48,16 @@ class TradingAgent:
         account = await self.broker.get_account()
         positions = await self.broker.get_positions()
         cycle_id = self.audit.start_cycle(account, positions) if self.audit else None
-        if account.daily_pl_pct <= -self.settings.risk.max_daily_loss_pct:
+        # On a daily loss stop, halt NEW entries but keep managing exits. We no
+        # longer cancel all open orders here: cancel_all_orders() also wipes the
+        # protective stop/take-profit legs of bracket orders, which would leave
+        # open positions unguarded on exactly the worst day. The position manager
+        # still runs below to actively trim/exit losers.
+        halt_entries = account.daily_pl_pct <= -self.settings.risk.max_daily_loss_pct
+        if halt_entries:
             self.console.print(
-                f"[red]daily loss stop reached[/red] {account.daily_pl_pct:.2f}%; canceling open orders"
+                f"[red]daily loss stop reached[/red] {account.daily_pl_pct:.2f}%; "
+                "halting new entries and managing exits only"
             )
             self._audit_event(
                 cycle_id,
@@ -49,17 +66,16 @@ class TradingAgent:
                 status="triggered",
                 reason=f"Daily loss stop reached: {account.daily_pl_pct:.2f}%.",
             )
-            await self.broker.cancel_all_orders()
-            if self.audit and cycle_id:
-                self.audit.finish_cycle(cycle_id, status="stopped")
-            return []
+            await self._cancel_opening_orders_for_halt(cycle_id)
         try:
             if self.audit:
                 self.audit.reconcile_position_states({position.symbol for position in positions})
             exit_candidates = self.position_manager.evaluate(positions)
             for candidate in exit_candidates:
                 self._audit_candidate(cycle_id, candidate)
-            entry_candidates = await self._generate_candidates(positions, cycle_id)
+            entry_candidates = (
+                [] if halt_entries else await self._generate_candidates(positions, cycle_id)
+            )
             candidates = [*exit_candidates, *entry_candidates]
             decisions = [self.risk.evaluate(candidate, account, positions) for candidate in candidates]
             for decision in decisions:
@@ -67,10 +83,10 @@ class TradingAgent:
             self._print_decisions(account, decisions)
 
             if self.settings.agent.execute_orders:
-                await self._submit_decisions(decisions, cycle_id)
+                await self._submit_decisions(decisions, account, cycle_id)
                 await self._sync_recent_order_updates(cycle_id)
             if self.audit and cycle_id:
-                self.audit.finish_cycle(cycle_id)
+                self.audit.finish_cycle(cycle_id, status="stopped" if halt_entries else "completed")
             return decisions
         except Exception as exc:
             if self.audit and cycle_id:
@@ -159,12 +175,19 @@ class TradingAgent:
     async def _submit_decisions(
         self,
         decisions: list[RiskDecision],
+        account,
         cycle_id: int | None,
     ) -> None:
         open_orders = await self._open_order_reservations()
         daily_counts = self._daily_order_counts()
         max_entry_orders = self.settings.agent.max_entry_orders_per_day(live=self.settings.is_live)
         max_total_orders = self.settings.agent.max_total_orders_per_day(live=self.settings.is_live)
+        # Cycle-aggregate cash budget. The risk engine sizes each candidate
+        # independently against the same account snapshot, so without this the
+        # agent could approve several buys that each believe they have the full
+        # cash buffer. We decrement a shared budget as cash-consuming orders are
+        # submitted and skip anything that would overrun it.
+        remaining_cash = self._cycle_cash_budget(account)
         exit_decisions = [
             decision
             for decision in decisions
@@ -179,10 +202,8 @@ class TradingAgent:
         submitted_entries = 0
         submitted_total = 0
         for decision in [*exit_decisions, *entry_decisions]:
-            if (
-                not decision.candidate.metadata.get("exit")
-                and submitted_entries >= self.settings.agent.max_orders_per_cycle
-            ):
+            is_exit = bool(decision.candidate.metadata.get("exit"))
+            if not is_exit and submitted_entries >= self.settings.agent.max_orders_per_cycle:
                 break
             if not decision.approved or not decision.intent:
                 continue
@@ -206,34 +227,68 @@ class TradingAgent:
                     reason=cap_reason,
                 )
                 continue
-            skip_reason = self._skip_due_to_open_orders(decision, open_orders)
-            if skip_reason:
-                self.console.print(f"[yellow]order skipped[/yellow] {decision.intent.symbol}: {skip_reason}")
+            if not is_exit:
+                skip_reason = self._skip_due_to_open_orders(decision, open_orders)
+                if skip_reason:
+                    self.console.print(f"[yellow]order skipped[/yellow] {decision.intent.symbol}: {skip_reason}")
+                    self._audit_event(
+                        cycle_id,
+                        "order",
+                        {"intent": decision.intent, "open_orders": open_orders},
+                        symbol=decision.intent.symbol,
+                        strategy=decision.candidate.strategy,
+                        status="skipped",
+                        reason=skip_reason,
+                    )
+                    continue
+
+            cash_required = self._estimated_cash_requirement(decision)
+            if cash_required > remaining_cash + 0.01:
+                budget_reason = (
+                    f"Cycle cash budget exhausted: needs ${cash_required:,.2f}, "
+                    f"${remaining_cash:,.2f} remaining after this cycle's orders."
+                )
+                self.console.print(f"[yellow]order skipped[/yellow] {decision.intent.symbol}: {budget_reason}")
                 self._audit_event(
                     cycle_id,
                     "order",
-                    {"intent": decision.intent, "open_orders": open_orders},
+                    {"intent": decision.intent, "cash_required": cash_required, "remaining_cash": remaining_cash},
                     symbol=decision.intent.symbol,
                     strategy=decision.candidate.strategy,
                     status="skipped",
-                    reason=skip_reason,
+                    reason=budget_reason,
                 )
                 continue
+            order = None
             try:
                 order = await self.broker.submit_order(decision.intent)
             except Exception as exc:
-                self.console.print(f"[red]order rejected[/red] {decision.intent.symbol}: {exc}")
-                self._audit_event(
-                    cycle_id,
-                    "order",
-                    {"intent": decision.intent, "error": str(exc)},
-                    symbol=decision.intent.symbol,
-                    strategy=decision.candidate.strategy,
-                    status="rejected",
-                    reason=str(exc),
+                canceled_for_retry = (
+                    await self._cancel_conflicting_open_orders(decision, open_orders, cycle_id)
+                    if is_exit
+                    else 0
                 )
-                continue
-            if not decision.candidate.metadata.get("exit"):
+                if canceled_for_retry:
+                    try:
+                        order = await self.broker.submit_order(decision.intent)
+                    except Exception as retry_exc:
+                        exc = retry_exc
+                if order is None:
+                    self.console.print(f"[red]order rejected[/red] {decision.intent.symbol}: {exc}")
+                    self._audit_event(
+                        cycle_id,
+                        "order",
+                        {"intent": decision.intent, "error": str(exc)},
+                        symbol=decision.intent.symbol,
+                        strategy=decision.candidate.strategy,
+                        status="rejected",
+                        reason=str(exc),
+                    )
+                    continue
+            if is_exit:
+                await self._cancel_conflicting_open_orders(decision, open_orders, cycle_id)
+            remaining_cash = max(remaining_cash - cash_required, 0.0)
+            if not is_exit:
                 submitted_entries += 1
             submitted_total += 1
             self._audit_event(
@@ -246,14 +301,237 @@ class TradingAgent:
                 reason=order.get("status"),
             )
             self.console.print(f"[green]submitted[/green] {order.get('id')} {decision.intent.symbol}")
+            if not is_exit:
+                await self._place_protective_stop(decision, order, cycle_id)
+
+    def _cycle_cash_budget(self, account) -> float:
+        cash_buffer = account.equity * (self.settings.risk.min_cash_buffer_pct / 100)
+        spendable_balance = min(account.cash, account.buying_power)
+        return max(spendable_balance - cash_buffer, 0.0)
+
+    def _estimated_cash_requirement(self, decision: RiskDecision) -> float:
+        intent = decision.intent
+        candidate = decision.candidate
+        if intent is None or candidate.metadata.get("exit"):
+            return 0.0
+        if intent.asset_class == AssetClass.OPTION:
+            qty = int(intent.qty or 1)
+            if candidate.strategy == "covered_call":
+                # Collateralized by shares already held; no new cash required.
+                return 0.0
+            if candidate.strategy == "cash_secured_put":
+                contract = candidate.metadata.get("contract", {})
+                strike = float(contract.get("strike_price", 0) or 0)
+                return strike * 100 * qty
+            price = float(intent.limit_price or candidate.entry_price or 0)
+            return price * 100 * qty
+        if intent.side != OrderSide.BUY:
+            return 0.0
+        if intent.notional is not None:
+            return float(intent.notional)
+        price = float(intent.limit_price or candidate.entry_price or 0)
+        return price * float(intent.qty or 0)
+
+    async def _cancel_conflicting_open_orders(
+        self,
+        decision: RiskDecision,
+        open_orders: dict,
+        cycle_id: int | None,
+    ) -> int:
+        if not decision.intent:
+            return 0
+        symbol = decision.intent.symbol
+        if symbol not in open_orders["symbols"]:
+            return 0
+        canceled = 0
+        for order in open_orders["orders"]:
+            if str(order.get("symbol") or "") != symbol:
+                continue
+            order_id = str(order.get("id") or "")
+            if not order_id:
+                continue
+            try:
+                await self.broker.cancel_order(order_id)
+            except Exception as exc:
+                self.console.print(f"[yellow]could not cancel resting order[/yellow] {order_id}: {exc}")
+                continue
+            canceled += 1
+            self._audit_event(
+                cycle_id,
+                "order",
+                {"canceled_order_id": order_id, "symbol": symbol},
+                symbol=symbol,
+                strategy=decision.candidate.strategy,
+                status="canceled",
+                reason="Canceled resting order so the position exit can be submitted.",
+            )
+        open_orders["symbols"].discard(symbol)
+        return canceled
+
+    async def _cancel_opening_orders_for_halt(self, cycle_id: int | None) -> None:
+        try:
+            open_orders = await self.broker.get_open_orders()
+        except Exception as exc:
+            self.console.print(f"[yellow]daily-loss open-order check failed[/yellow] {exc}")
+            self._audit_event(
+                cycle_id,
+                "order",
+                {"error": str(exc)},
+                status="failed",
+                reason=f"Could not inspect open orders during daily-loss halt: {exc}",
+            )
+            return
+
+        for order in open_orders:
+            if not self._is_opening_order(order):
+                continue
+            order_id = str(order.get("id") or "")
+            if not order_id:
+                continue
+            try:
+                await self.broker.cancel_order(order_id)
+            except Exception as exc:
+                self.console.print(f"[yellow]could not cancel opening order[/yellow] {order_id}: {exc}")
+                self._audit_event(
+                    cycle_id,
+                    "order",
+                    {"open_order": order, "error": str(exc)},
+                    symbol=order.get("symbol"),
+                    strategy=self._strategy_from_order(order),
+                    status="failed",
+                    reason=f"Could not cancel opening order during daily-loss halt: {exc}",
+                )
+                continue
+            self._audit_event(
+                cycle_id,
+                "order",
+                {"canceled_order": order},
+                symbol=order.get("symbol"),
+                strategy=self._strategy_from_order(order),
+                status="canceled",
+                reason="Canceled opening order during daily-loss halt; protective orders preserved.",
+            )
+
+    def _is_opening_order(self, order: dict) -> bool:
+        client_order_id = str(order.get("client_order_id") or "")
+        if "protect" in client_order_id:
+            return False
+        position_intent = str(order.get("position_intent") or "")
+        if position_intent.endswith("_to_open"):
+            return True
+        if position_intent.endswith("_to_close"):
+            return False
+        order_type = str(order.get("type") or order.get("order_type") or "")
+        side = str(order.get("side") or "")
+        if client_order_id.startswith("ta-") and side == "buy" and order_type not in {"stop", "stop_limit"}:
+            return True
+        return False
+
+    def _strategy_from_order(self, order: dict) -> str | None:
+        client_order_id = str(order.get("client_order_id") or "")
+        if not client_order_id.startswith("ta-"):
+            return None
+        return client_order_id[3:].rsplit("-", 1)[0] or None
+
+    async def _place_protective_stop(
+        self,
+        decision: RiskDecision,
+        order: dict,
+        cycle_id: int | None,
+    ) -> None:
+        intent = decision.intent
+        candidate = decision.candidate
+        # Crypto cannot use Alpaca bracket orders, so a fresh crypto entry has no
+        # broker-side stop. Rest a GTC stop-limit sell as a hard floor between
+        # position-manager polls. If the broker rejects it we fall back to the
+        # position manager's software stop (which always runs each cycle).
+        if not intent or intent.asset_class != AssetClass.CRYPTO or intent.side != OrderSide.BUY:
+            return
+        stop_price = candidate.stop_price
+        if not stop_price or stop_price <= 0:
+            return
+        qty = self._protective_qty(intent, order)
+        if not qty or qty <= 0:
+            self._audit_event(
+                cycle_id,
+                "order",
+                {"intent": intent, "broker_order": order},
+                symbol=intent.symbol,
+                strategy="crypto_protective_stop",
+                status="deferred",
+                reason="Crypto entry is not filled yet; protective stop will be placed after broker fill sync.",
+            )
+            return
+        protective = self._crypto_protective_intent(intent.symbol, qty, stop_price, intent.client_order_id)
+        try:
+            protect_order = await self.broker.submit_order(protective)
+        except Exception as exc:
+            self.console.print(
+                f"[yellow]crypto protective stop not placed[/yellow] {intent.symbol}: {exc}"
+            )
+            self._audit_event(
+                cycle_id,
+                "order",
+                {"intent": protective, "error": str(exc)},
+                symbol=intent.symbol,
+                strategy="crypto_protective_stop",
+                status="rejected",
+                reason=f"Protective stop rejected; relying on position-manager exit: {exc}",
+            )
+            return
+        self._audit_event(
+            cycle_id,
+            "order",
+            {"intent": protective, "broker_order": protect_order},
+            symbol=intent.symbol,
+            strategy="crypto_protective_stop",
+            status="submitted",
+            reason=protect_order.get("status"),
+        )
+        self.console.print(f"[green]protective stop[/green] {intent.symbol} @ {stop_price:.2f}")
+
+    def _protective_qty(self, intent: OrderIntent, order: dict) -> float | None:
+        filled = order.get("filled_qty") if isinstance(order, dict) else None
+        try:
+            filled_qty = float(filled) if filled not in {None, ""} else 0.0
+        except (TypeError, ValueError):
+            filled_qty = 0.0
+        if filled_qty > 0:
+            return round(filled_qty, 8)
+        return None
+
+    def _crypto_protective_intent(
+        self,
+        symbol: str,
+        qty: float,
+        stop_price: float,
+        parent_client_order_id: str | None,
+    ) -> OrderIntent:
+        return OrderIntent(
+            symbol=symbol,
+            asset_class=AssetClass.CRYPTO,
+            side=OrderSide.SELL,
+            qty=qty,
+            order_type=OrderType.STOP_LIMIT,
+            time_in_force=TimeInForce.GTC,
+            stop_price=round(stop_price, 2),
+            limit_price=round(stop_price * 0.99, 2),
+            client_order_id=f"ta-crypto-protect-{uuid.uuid4().hex[:12]}",
+            metadata={
+                "protective_stop": True,
+                "parent_symbol": symbol,
+                "parent_client_order_id": parent_client_order_id,
+            },
+        )
 
     async def _sync_recent_order_updates(self, cycle_id: int | None) -> None:
         if not self.broker_sync:
             return
         try:
-            await self.broker_sync.sync_closed_orders(
+            result = await self.broker_sync.sync_closed_orders(
                 cycle_id=cycle_id,
                 after=start_of_trading_day().isoformat(),
+                include_orders=True,
             )
         except Exception as exc:
             self.console.print(f"[yellow]order fill audit skipped[/yellow] {exc}")
@@ -265,6 +543,84 @@ class TradingAgent:
                 reason=str(exc),
             )
             return
+        for order in result.get("orders", []):
+            await self._place_crypto_protective_stop_from_fill(order, cycle_id)
+
+    async def _place_crypto_protective_stop_from_fill(
+        self,
+        broker_order: dict,
+        cycle_id: int | None,
+    ) -> None:
+        if not self.audit:
+            return
+        symbol = str(broker_order.get("symbol") or "")
+        asset_class = str(broker_order.get("asset_class") or "")
+        if "/" not in symbol and asset_class != "crypto":
+            return
+        if str(broker_order.get("side") or "") != "buy":
+            return
+        client_order_id = str(broker_order.get("client_order_id") or "")
+        if not client_order_id or "protect" in client_order_id:
+            return
+        if self.audit.crypto_protective_stop_exists(client_order_id):
+            return
+        qty = self._filled_qty(broker_order)
+        if not qty:
+            return
+        current_qty = await self._current_position_qty(symbol)
+        if current_qty <= 0:
+            return
+        qty = min(qty, current_qty)
+        entry_event = self.audit.order_event_by_client_order_id(client_order_id)
+        if not entry_event:
+            return
+        intent = (entry_event.get("payload") or {}).get("intent") or {}
+        stop_price = intent.get("stop_loss_price")
+        if not stop_price:
+            return
+        protective = self._crypto_protective_intent(symbol, qty, float(stop_price), client_order_id)
+        try:
+            protect_order = await self.broker.submit_order(protective)
+        except Exception as exc:
+            self.console.print(f"[yellow]crypto protective stop not placed[/yellow] {symbol}: {exc}")
+            self._audit_event(
+                cycle_id,
+                "order",
+                {"intent": protective, "broker_order": broker_order, "error": str(exc)},
+                symbol=symbol,
+                strategy="crypto_protective_stop",
+                status="rejected",
+                reason=f"Protective stop rejected after fill sync; relying on position-manager exit: {exc}",
+            )
+            return
+        self._audit_event(
+            cycle_id,
+            "order",
+            {"intent": protective, "broker_order": protect_order, "parent_broker_order": broker_order},
+            symbol=symbol,
+            strategy="crypto_protective_stop",
+            status="submitted",
+            reason=protect_order.get("status"),
+        )
+
+    def _filled_qty(self, order: dict) -> float | None:
+        value = order.get("filled_qty")
+        try:
+            qty = float(value) if value not in {None, ""} else 0.0
+        except (TypeError, ValueError):
+            return None
+        return round(qty, 8) if qty > 0 else None
+
+    async def _current_position_qty(self, symbol: str) -> float:
+        try:
+            positions = await self.broker.get_positions()
+        except Exception as exc:
+            self.console.print(f"[yellow]position check failed before crypto stop[/yellow] {symbol}: {exc}")
+            return 0.0
+        for position in positions:
+            if position.symbol == symbol:
+                return max(float(position.qty), 0.0)
+        return 0.0
 
     def _daily_order_counts(self) -> dict[str, int]:
         if not self.audit:

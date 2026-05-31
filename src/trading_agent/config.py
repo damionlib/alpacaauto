@@ -61,6 +61,7 @@ class RiskConfig(BaseModel):
     max_crypto_position_pct: float = Field(default=10.0, gt=0, le=100)
     max_options_premium_pct: float = Field(default=2.0, gt=0, le=10)
     min_cash_buffer_pct: float = Field(default=5.0, ge=0, le=50)
+    max_entry_slippage_pct: float = Field(default=0.5, ge=0, le=5)
 
 
 class StrategyConfig(BaseModel):

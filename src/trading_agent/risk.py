@@ -110,23 +110,46 @@ class RiskEngine:
         if notional < 1:
             return self._reject(candidate, "Calculated order notional is below $1.")
 
-        qty = None
-        if candidate.asset_class != AssetClass.CRYPTO:
-            qty = int(notional / candidate.entry_price)
-            if qty < 1:
-                return self._reject(candidate, "Calculated equity quantity is below 1 share.")
-            notional = qty * candidate.entry_price
+        # Price entries as marketable limit orders so a gap or thin quote cannot
+        # fill far away from the price the sizing/stop math assumed.
+        slippage = self.settings.risk.max_entry_slippage_pct / 100
+        if candidate.side == OrderSide.BUY:
+            limit_price = round(candidate.entry_price * (1 + slippage), 2)
+        else:
+            limit_price = round(candidate.entry_price * (1 - slippage), 2)
+
+        if candidate.asset_class == AssetClass.CRYPTO:
+            qty = round(notional / candidate.entry_price, 8)
+            if qty <= 0:
+                return self._reject(candidate, "Calculated crypto quantity is zero.")
+            intent = OrderIntent(
+                symbol=candidate.symbol,
+                asset_class=candidate.asset_class,
+                side=candidate.side,
+                qty=qty,
+                order_type=OrderType.LIMIT,
+                time_in_force=TimeInForce.GTC,
+                limit_price=limit_price,
+                stop_loss_price=candidate.stop_price,
+                client_order_id=self._client_order_id(candidate),
+                metadata=candidate.metadata,
+            )
+            return RiskDecision(approved=True, reason="Approved by risk engine.", intent=intent, candidate=candidate)
+
+        qty = int(notional / candidate.entry_price)
+        if qty < 1:
+            return self._reject(candidate, "Calculated equity quantity is below 1 share.")
 
         intent = OrderIntent(
             symbol=candidate.symbol,
             asset_class=candidate.asset_class,
             side=candidate.side,
             qty=qty,
-            notional=round(notional, 2) if candidate.asset_class == AssetClass.CRYPTO else None,
-            order_type=OrderType.MARKET,
-            time_in_force=TimeInForce.GTC if candidate.asset_class == AssetClass.CRYPTO else TimeInForce.DAY,
-            stop_loss_price=candidate.stop_price if candidate.asset_class != AssetClass.CRYPTO else None,
-            take_profit_price=candidate.take_profit_price if candidate.asset_class != AssetClass.CRYPTO else None,
+            order_type=OrderType.LIMIT,
+            time_in_force=TimeInForce.DAY,
+            limit_price=limit_price,
+            stop_loss_price=candidate.stop_price,
+            take_profit_price=candidate.take_profit_price,
             client_order_id=self._client_order_id(candidate),
             metadata=candidate.metadata,
         )

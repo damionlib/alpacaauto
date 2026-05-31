@@ -287,6 +287,41 @@ class AuditStore:
             ).fetchone()
         return row is not None
 
+    def order_event_by_client_order_id(self, client_order_id: str) -> dict[str, Any] | None:
+        pattern = f'%"client_order_id": "{client_order_id}"%'
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                select *
+                from audit_events
+                where event_type = 'order'
+                  and status = 'submitted'
+                  and strategy != 'crypto_protective_stop'
+                  and payload_json like ?
+                order by id desc
+                limit 1
+                """,
+                (pattern,),
+            ).fetchone()
+        return self._event_row(row) if row else None
+
+    def crypto_protective_stop_exists(self, parent_client_order_id: str) -> bool:
+        pattern = f'%"parent_client_order_id": "{parent_client_order_id}"%'
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                select 1
+                from audit_events
+                where event_type = 'order'
+                  and strategy = 'crypto_protective_stop'
+                  and status = 'submitted'
+                  and payload_json like ?
+                limit 1
+                """,
+                (pattern,),
+            ).fetchone()
+        return row is not None
+
     def update_position_state(
         self,
         *,

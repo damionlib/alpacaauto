@@ -37,7 +37,8 @@ class BrokerOrderSync:
         after: str | None = None,
         until: str | None = None,
         limit: int = 500,
-    ) -> dict[str, int]:
+        include_orders: bool = False,
+    ) -> dict[str, Any]:
         orders = await self.broker.get_recent_orders(
             status="closed",
             limit=limit,
@@ -61,7 +62,10 @@ class BrokerOrderSync:
                 reason=order.get("filled_at") or order.get("canceled_at") or order.get("expired_at"),
             )
             synced += 1
-        return {"fetched": len(orders), "synced": synced, "skipped": skipped}
+        result: dict[str, Any] = {"fetched": len(orders), "synced": synced, "skipped": skipped}
+        if include_orders:
+            result["orders"] = orders
+        return result
 
 
 def strategy_from_client_order_id(order: dict[str, Any]) -> str | None:

@@ -22,6 +22,7 @@ class OrderSide(StrEnum):
 class OrderType(StrEnum):
     MARKET = "market"
     LIMIT = "limit"
+    STOP_LIMIT = "stop_limit"
 
 
 class TimeInForce(StrEnum):
@@ -98,6 +99,7 @@ class OrderIntent(BaseModel):
     order_type: OrderType = OrderType.MARKET
     time_in_force: TimeInForce = TimeInForce.DAY
     limit_price: float | None = None
+    stop_price: float | None = None
     order_class: str | None = None
     legs: list[dict[str, str]] = Field(default_factory=list)
     stop_loss_price: float | None = None

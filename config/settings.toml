@@ -34,6 +34,7 @@ max_position_pct = 12.0
 max_crypto_position_pct = 10.0
 max_options_premium_pct = 2.0
 min_cash_buffer_pct = 5.0
+max_entry_slippage_pct = 0.5
 
 [strategy]
 symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "BTC/USD", "ETH/USD"]
