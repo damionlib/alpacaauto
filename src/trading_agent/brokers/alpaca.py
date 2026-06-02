@@ -174,6 +174,16 @@ class AlpacaBroker:
     async def cancel_all_orders(self) -> list[dict]:
         return await self._request("DELETE", f"{self.trading_base_url}/v2/orders")
 
+    async def close_all_positions(self, *, cancel_orders: bool = True) -> list[dict]:
+        return await self._request(
+            "DELETE",
+            f"{self.trading_base_url}/v2/positions",
+            params={"cancel_orders": str(cancel_orders).lower()},
+        )
+
+    async def close_position(self, symbol: str) -> dict:
+        return await self._request("DELETE", f"{self.trading_base_url}/v2/positions/{symbol}")
+
     async def cancel_order(self, order_id: str) -> None:
         await self._request("DELETE", f"{self.trading_base_url}/v2/orders/{order_id}")
 

@@ -81,6 +81,77 @@ def cancel_open_orders(config: str = "config/settings.toml") -> None:
     asyncio.run(_run())
 
 
+@app.command("paper-reset")
+def paper_reset(
+    config: str = "config/settings.toml",
+    backup_audit: bool = True,
+) -> None:
+    """Cancel paper orders and close paper positions before a clean evaluation run."""
+
+    async def _run() -> None:
+        settings = load_settings(config)
+        if settings.broker.mode != "paper":
+            raise typer.BadParameter("paper-reset refuses to run unless broker.mode is paper.")
+
+        if backup_audit and settings.audit.enabled:
+            store = AuditStore(settings.audit.database_path)
+            backup_path = store.backup()
+            console.print(f"Audit backup written to {backup_path.resolve()}")
+
+        broker = AlpacaBroker(settings)
+        account_before = await broker.get_account()
+        positions_before = await broker.get_positions()
+        open_orders_before = await broker.get_open_orders()
+        cancelled = await broker.cancel_all_orders()
+        closed: list[dict] = []
+        close_errors: list[str] = []
+        try:
+            closed = await broker.close_all_positions(cancel_orders=True)
+        except RuntimeError as error:
+            close_errors.append(str(error))
+
+        open_orders_mid = await broker.get_open_orders()
+        pending_symbols = {str(order.get("symbol", "")) for order in open_orders_mid}
+        remaining_positions = sorted(
+            await broker.get_positions(),
+            key=lambda position: 0 if position.asset_class.value == "option" else 1,
+        )
+        individual_closes: list[dict] = []
+        for position in remaining_positions:
+            if position.symbol in pending_symbols:
+                continue
+            try:
+                result = await broker.close_position(position.symbol)
+            except RuntimeError as error:
+                close_errors.append(f"{position.symbol}: {error}")
+                continue
+            individual_closes.append(result)
+            open_orders_mid = await broker.get_open_orders()
+            pending_symbols = {str(order.get("symbol", "")) for order in open_orders_mid}
+
+        account_after = await broker.get_account()
+        positions_after = await broker.get_positions()
+        open_orders_after = await broker.get_open_orders()
+
+        console.print(
+            {
+                "mode": settings.broker.mode,
+                "account_before": account_before.model_dump(),
+                "positions_before": len(positions_before),
+                "open_orders_before": len(open_orders_before),
+                "cancelled_orders": cancelled,
+                "close_positions": closed,
+                "individual_closes": individual_closes,
+                "close_errors": close_errors,
+                "account_after": account_after.model_dump(),
+                "positions_after": len(positions_after),
+                "open_orders_after": len(open_orders_after),
+            }
+        )
+
+    asyncio.run(_run())
+
+
 @app.command("run-once")
 def run_once(config: str = "config/settings.toml") -> None:
     settings = load_settings(config)

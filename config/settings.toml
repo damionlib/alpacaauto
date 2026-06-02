@@ -15,7 +15,7 @@ live_max_total_orders_per_day = 6
 
 [audit]
 enabled = true
-database_path = "data/trading_agent.sqlite3"
+database_path = "data/trading_agent_paper_clean_20260602.sqlite3"
 
 [position_manager]
 enabled = true
