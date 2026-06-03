@@ -99,6 +99,12 @@ class CatalystConfig(BaseModel):
 
 class ResearchConfig(BaseModel):
     news_headline_limit: int = Field(default=8, ge=0, le=50)
+    news_cache_enabled: bool = True
+    news_cache_database_path: str = "data/news_cache.sqlite3"
+    news_cache_ttl_seconds: int = Field(default=1800, ge=0)
+    marketaux_daily_call_limit: int = Field(default=90, ge=0)
+    alpaca_news_daily_call_limit: int = Field(default=0, ge=0)
+    yahoo_news_daily_call_limit: int = Field(default=0, ge=0)
     sec_companyfacts_enabled: bool = True
     crypto_research_enabled: bool = True
     crypto_onchain_enabled: bool = False
@@ -118,6 +124,7 @@ class Settings(BaseModel):
     research: ResearchConfig = Field(default_factory=ResearchConfig)
     alpaca_api_key_id: SecretStr | None = None
     alpaca_api_secret_key: SecretStr | None = None
+    marketaux_api_token: SecretStr | None = None
     allow_live_trading: bool = False
     sec_user_agent: str = "trading-agent your-email@example.com"
 
@@ -144,6 +151,7 @@ def load_settings(config_path: str | Path = "config/settings.toml") -> Settings:
     env_data = {
         "alpaca_api_key_id": os.getenv("ALPACA_API_KEY_ID"),
         "alpaca_api_secret_key": os.getenv("ALPACA_API_SECRET_KEY"),
+        "marketaux_api_token": os.getenv("MARKETAUX_API_TOKEN"),
         "allow_live_trading": os.getenv("ALLOW_LIVE_TRADING", "false").lower()
         in {"1", "true", "yes", "on"},
         "sec_user_agent": os.getenv("SEC_USER_AGENT", data.get("sec_user_agent")),

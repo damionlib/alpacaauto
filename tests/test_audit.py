@@ -61,6 +61,59 @@ def test_audit_summary_includes_catalyst_predictions(tmp_path) -> None:
     assert summary["catalyst_predictions"][0]["payload"]["prediction_score"] == 82
 
 
+def test_events_filter_by_exact_symbol_column_not_payload_text(tmp_path) -> None:
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    cycle_id = store.start_cycle(
+        AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000),
+        [],
+    )
+    store.record_event(
+        cycle_id=cycle_id,
+        event_type="order",
+        payload={"intent": {"symbol": "ORCL"}, "open_orders": [{"symbol": "HON"}]},
+        symbol="ORCL",
+        status="skipped",
+    )
+    store.record_event(
+        cycle_id=cycle_id,
+        event_type="risk_decision",
+        payload={"candidate": {"symbol": "HON"}},
+        symbol="HON",
+        status="approved",
+    )
+
+    hon_events = store.events(symbol="hon", limit=10)
+
+    assert [event["symbol"] for event in hon_events] == ["HON"]
+    assert hon_events[0]["event_type"] == "risk_decision"
+
+
+def test_events_filter_by_status(tmp_path) -> None:
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    cycle_id = store.start_cycle(
+        AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000),
+        [],
+    )
+    store.record_event(
+        cycle_id=cycle_id,
+        event_type="order",
+        payload={},
+        symbol="AAPL",
+        status="submitted",
+    )
+    store.record_event(
+        cycle_id=cycle_id,
+        event_type="order",
+        payload={},
+        symbol="MSFT",
+        status="rejected",
+    )
+
+    events = store.events(event_type="order", status="submitted", limit=10)
+
+    assert [event["symbol"] for event in events] == ["AAPL"]
+
+
 def test_audit_store_preserves_existing_cycles_when_reopened(tmp_path) -> None:
     database_path = tmp_path / "audit.sqlite3"
     first_store = AuditStore(database_path)

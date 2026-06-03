@@ -62,6 +62,37 @@ def test_catalyst_blocks_rumor_and_macro_event_risk() -> None:
     assert "rumor_only_catalyst" in prediction.risks
 
 
+def test_catalyst_uses_marketaux_entity_sentiment_and_summary() -> None:
+    engine = CatalystEngine(Settings())
+    prediction = engine.evaluate(
+        MarketSnapshot(
+            symbol="GOOD",
+            asset_class=AssetClass.EQUITY,
+            price=130,
+            closes=[90 + index for index in range(60)],
+        ),
+        ResearchSnapshot(
+            symbol="GOOD",
+            news=[
+                NewsItem(
+                    title="GOOD signs customer agreement",
+                    summary="Company raises guidance after record profit and a new contract.",
+                    source="marketaux",
+                    sentiment_score=0.45,
+                ),
+            ],
+            sec_summary={
+                "latest_revenue": {"value": 1_000_000_000},
+                "latest_net_income": {"value": 200_000_000},
+            },
+        ),
+    )
+
+    assert prediction.metadata["news"]["sentiment_avg"] == 0.45
+    assert any("Entity news sentiment is positive" in item for item in prediction.evidence)
+    assert any("positive catalyst keyword" in item for item in prediction.evidence)
+
+
 def test_catalyst_blocks_misaligned_bullish_candidate() -> None:
     engine = CatalystEngine(Settings())
     prediction = engine.evaluate(

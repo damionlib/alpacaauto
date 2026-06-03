@@ -283,17 +283,24 @@ class CatalystEngine:
         )
 
     def _news_catalyst(self, research: ResearchSnapshot) -> _LayerResult:
-        text = " ".join(item.title.lower() for item in research.news)
+        text = self._news_text(research)
         positive = self._term_hits(text, POSITIVE_TERMS)
         negative = self._term_hits(text, NEGATIVE_TERMS)
         rumor = self._term_hits(text, RUMOR_TERMS)
         macro = self._term_hits(text, MACRO_TERMS)
         geo = self._term_hits(text, GEOPOLITICAL_TERMS)
         official = self._term_hits(text, OFFICIAL_TERMS)
+        sentiment = self._average_news_sentiment(research)
 
         score = 50 + min(positive * 8, 28) - min(negative * 12, 45)
         evidence: list[str] = []
         risks: list[str] = []
+        if sentiment is not None:
+            score += self._bounded(sentiment * 20, -15, 15)
+            if sentiment > 0.1:
+                evidence.append(f"Entity news sentiment is positive at {sentiment:.2f}.")
+            elif sentiment < -0.1:
+                risks.append(f"Entity news sentiment is negative at {sentiment:.2f}.")
         if positive:
             evidence.append(f"{positive} positive catalyst keyword(s) found in headlines.")
         if negative:
@@ -321,6 +328,7 @@ class CatalystEngine:
                 "macro_hits": macro,
                 "geopolitical_hits": geo,
                 "official_hits": official,
+                "sentiment_avg": sentiment if sentiment is not None else 0.0,
             },
         )
 
@@ -414,7 +422,7 @@ class CatalystEngine:
         )
 
     def _event_risk(self, research: ResearchSnapshot, market_layer: _LayerResult) -> _LayerResult:
-        text = " ".join(item.title.lower() for item in research.news)
+        text = self._news_text(research)
         earnings_hits = self._term_hits(text, {"earnings", "guidance", "quarter", "results"})
         macro_hits = self._term_hits(text, MACRO_TERMS | GEOPOLITICAL_TERMS)
         score = 72.0
@@ -511,6 +519,24 @@ class CatalystEngine:
 
     def _term_hits(self, text: str, terms: set[str]) -> int:
         return sum(1 for term in terms if term in text)
+
+    def _news_text(self, research: ResearchSnapshot) -> str:
+        parts: list[str] = []
+        for item in research.news:
+            parts.append(item.title)
+            if item.summary:
+                parts.append(item.summary)
+        return " ".join(parts).lower()
+
+    def _average_news_sentiment(self, research: ResearchSnapshot) -> float | None:
+        values = [
+            item.sentiment_score
+            for item in research.news
+            if item.sentiment_score is not None
+        ]
+        if not values:
+            return None
+        return sum(values) / len(values)
 
     def _bounded(self, value: float, lower: float, upper: float) -> float:
         return max(lower, min(upper, value))

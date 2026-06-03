@@ -77,6 +77,12 @@ require_medium_confidence_for_options = true
 
 [research]
 news_headline_limit = 8
+news_cache_enabled = true
+news_cache_database_path = "data/news_cache.sqlite3"
+news_cache_ttl_seconds = 1800
+marketaux_daily_call_limit = 90
+alpaca_news_daily_call_limit = 0
+yahoo_news_daily_call_limit = 0
 sec_companyfacts_enabled = true
 crypto_research_enabled = true
 crypto_onchain_enabled = false

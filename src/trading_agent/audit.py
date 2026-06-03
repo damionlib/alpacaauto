@@ -165,6 +165,8 @@ class AuditStore:
         *,
         cycle_id: int | None = None,
         event_type: str | None = None,
+        symbol: str | None = None,
+        status: str | None = None,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
         query = "select * from audit_events"
@@ -176,6 +178,12 @@ class AuditStore:
         if event_type:
             clauses.append("event_type = ?")
             params.append(event_type)
+        if symbol:
+            clauses.append("upper(symbol) = upper(?)")
+            params.append(symbol)
+        if status:
+            clauses.append("upper(status) = upper(?)")
+            params.append(status)
         if clauses:
             query += " where " + " and ".join(clauses)
         query += " order by id desc limit ?"

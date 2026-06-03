@@ -36,11 +36,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             limit = self._int_param(params, "limit", 200)
             cycle_id = self._optional_int_param(params, "cycle_id")
             event_type = params.get("event_type", [None])[0] or None
+            symbol = params.get("symbol", [None])[0] or None
+            status = params.get("status", [None])[0] or None
             self._send_json(
                 {
                     "events": self.server.store.events(
                         cycle_id=cycle_id,
                         event_type=event_type,
+                        symbol=symbol,
+                        status=status,
                         limit=limit,
                     )
                 }
@@ -179,7 +183,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       justify-content: space-between;
       margin: 14px 0 10px;
     }
-    select, button {
+    select, input, button {
       background: var(--surface);
       border: 1px solid var(--line);
       border-radius: 6px;
@@ -189,6 +193,14 @@ DASHBOARD_HTML = r"""<!doctype html>
       padding: 6px 10px;
     }
     button { cursor: pointer; }
+    input { min-width: 220px; text-transform: uppercase; }
+    .filterbar {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 10px;
+    }
     table {
       border-collapse: collapse;
       background: var(--surface);
@@ -285,6 +297,14 @@ DASHBOARD_HTML = r"""<!doctype html>
       <button class="tab" data-tab="research">Research</button>
       <button class="tab" data-tab="audit">Audit History</button>
     </nav>
+    <div class="toolbar filterbar" id="symbolFilterBar">
+      <div>
+        <input id="symbolFilter" type="text" placeholder="Filter symbol, e.g. HON or AAPL260617C00305000" autocomplete="off">
+        <button id="applySymbolFilter">Apply</button>
+        <button id="clearSymbolFilter">Clear</button>
+      </div>
+      <div class="meta" id="symbolFilterMeta">Showing latest cycle</div>
+    </div>
     <section id="decisions" class="panel"></section>
     <section id="orders" class="panel hidden"></section>
     <section id="catalyst" class="panel hidden"></section>
@@ -305,6 +325,22 @@ DASHBOARD_HTML = r"""<!doctype html>
             <option value="broker_order_update">Broker order updates</option>
             <option value="risk_stop">Risk stops</option>
           </select>
+          <select id="eventStatus">
+            <option value="">All statuses</option>
+            <option value="approved">Approved</option>
+            <option value="rejected">Rejected</option>
+            <option value="submitted">Submitted</option>
+            <option value="skipped">Skipped</option>
+            <option value="filled">Filled</option>
+            <option value="captured">Captured</option>
+            <option value="generated">Generated</option>
+            <option value="blocked">Blocked</option>
+            <option value="bullish">Bullish</option>
+            <option value="bearish">Bearish</option>
+            <option value="failed">Failed</option>
+            <option value="canceled">Canceled</option>
+            <option value="triggered">Triggered</option>
+          </select>
           <button id="reloadAudit">Refresh</button>
         </div>
         <div class="meta">Newest events first</div>
@@ -313,7 +349,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     </section>
   </main>
   <script>
-    const state = { summary: null, performance: null, auditEvents: [] };
+    const state = { summary: null, performance: null, auditEvents: [], symbolFilter: "", symbolData: null };
     const currency = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 
     function fmtMoney(value) {
@@ -343,6 +379,65 @@ DASHBOARD_HTML = r"""<!doctype html>
     }
     function payload(event) {
       return event.payload || {};
+    }
+    function displaySummary() {
+      if (!state.symbolFilter || !state.symbolData) return state.summary || {};
+      return { ...(state.summary || {}), ...state.symbolData };
+    }
+    function updateSymbolFilterMeta() {
+      const meta = document.getElementById("symbolFilterMeta");
+      if (!state.symbolFilter) {
+        meta.textContent = "Showing latest cycle";
+        return;
+      }
+      meta.textContent = `Filtering exact event symbol ${state.symbolFilter} across audit history`;
+    }
+    function syncFilterbarVisibility(activeTab) {
+      const filterbar = document.getElementById("symbolFilterBar");
+      filterbar.classList.toggle("hidden", activeTab === "performance");
+    }
+    async function fetchEventList(params) {
+      const query = new URLSearchParams({ limit: "500", ...params });
+      const response = await fetch(`/api/events?${query.toString()}`, { cache: "no-store" });
+      const data = await response.json();
+      return data.events || [];
+    }
+    async function loadSymbolData() {
+      if (!state.symbolFilter) {
+        state.symbolData = null;
+        updateSymbolFilterMeta();
+        return;
+      }
+      const symbol = state.symbolFilter;
+      const [
+        decisions,
+        orders,
+        marketSnapshots,
+        researchResults,
+        catalystPredictions,
+      ] = await Promise.all([
+        fetchEventList({ symbol, event_type: "risk_decision" }),
+        fetchEventList({ symbol, event_type: "order" }),
+        fetchEventList({ symbol, event_type: "market_snapshot" }),
+        fetchEventList({ symbol, event_type: "research_result" }),
+        fetchEventList({ symbol, event_type: "catalyst_prediction" }),
+      ]);
+      state.symbolData = {
+        decisions,
+        orders,
+        market_snapshots: marketSnapshots,
+        research_results: researchResults,
+        catalyst_predictions: catalystPredictions,
+      };
+      updateSymbolFilterMeta();
+    }
+    function renderMainTables() {
+      const summary = displaySummary();
+      renderDecisions(summary);
+      renderOrders(summary);
+      renderCatalyst(summary);
+      renderMarket(summary);
+      renderResearch(summary);
     }
     function renderTable(containerId, headers, rows, emptyText) {
       const container = document.getElementById(containerId);
@@ -592,17 +687,17 @@ DASHBOARD_HTML = r"""<!doctype html>
       const response = await fetch("/api/summary", { cache: "no-store" });
       state.summary = await response.json();
       renderMetrics(state.summary);
-      renderDecisions(state.summary);
-      renderOrders(state.summary);
-      renderCatalyst(state.summary);
-      renderMarket(state.summary);
-      renderResearch(state.summary);
+      await loadSymbolData();
+      renderMainTables();
       document.getElementById("refreshMeta").textContent = `Updated ${new Date().toLocaleTimeString()} • Auto-refreshing every 10s`;
     }
     async function loadAudit() {
       const eventType = document.getElementById("eventType").value;
+      const eventStatus = document.getElementById("eventStatus").value;
       const query = new URLSearchParams({ limit: "300" });
       if (eventType) query.set("event_type", eventType);
+      if (eventStatus) query.set("status", eventStatus);
+      if (state.symbolFilter) query.set("symbol", state.symbolFilter);
       const response = await fetch(`/api/events?${query.toString()}`, { cache: "no-store" });
       const data = await response.json();
       state.auditEvents = data.events || [];
@@ -638,15 +733,36 @@ DASHBOARD_HTML = r"""<!doctype html>
         document.querySelectorAll(".panel").forEach(item => item.classList.add("hidden"));
         tab.classList.add("active");
         document.getElementById(tab.dataset.tab).classList.remove("hidden");
+        syncFilterbarVisibility(tab.dataset.tab);
         if (tab.dataset.tab === "audit") loadAudit();
         if (tab.dataset.tab === "performance") loadPerformance();
       });
     });
     document.getElementById("reloadAudit").addEventListener("click", loadAudit);
     document.getElementById("eventType").addEventListener("change", loadAudit);
+    document.getElementById("eventStatus").addEventListener("change", loadAudit);
+    document.getElementById("applySymbolFilter").addEventListener("click", () => {
+      state.symbolFilter = document.getElementById("symbolFilter").value.trim().toUpperCase();
+      loadSummary();
+      if (!document.getElementById("audit").classList.contains("hidden")) loadAudit();
+    });
+    document.getElementById("clearSymbolFilter").addEventListener("click", () => {
+      document.getElementById("symbolFilter").value = "";
+      state.symbolFilter = "";
+      state.symbolData = null;
+      updateSymbolFilterMeta();
+      renderMainTables();
+      if (!document.getElementById("audit").classList.contains("hidden")) loadAudit();
+    });
+    document.getElementById("symbolFilter").addEventListener("keydown", event => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      document.getElementById("applySymbolFilter").click();
+    });
     loadSummary().catch(error => {
       document.getElementById("cycleMeta").textContent = `Dashboard load failed: ${error}`;
     });
+    syncFilterbarVisibility("decisions");
     setInterval(() => {
       loadSummary();
       if (!document.getElementById("performance").classList.contains("hidden")) loadPerformance();

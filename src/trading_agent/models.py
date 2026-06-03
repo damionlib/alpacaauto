@@ -68,6 +68,9 @@ class NewsItem(BaseModel):
     title: str
     url: str | None = None
     published: str | None = None
+    source: str | None = None
+    summary: str | None = None
+    sentiment_score: float | None = None
 
 
 class ResearchSnapshot(BaseModel):

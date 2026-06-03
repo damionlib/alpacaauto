@@ -5,14 +5,35 @@ import asyncio
 from trading_agent.config import Settings
 from trading_agent.models import ResearchSnapshot
 from trading_agent.research.crypto import CryptoResearchService
-from trading_agent.research.news import YahooFinanceNews
+from trading_agent.research.news import MarketNews, NewsCacheStore
 from trading_agent.research.sec import SecClient
 
 
 class ResearchService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.news = YahooFinanceNews()
+        api_key_id = settings.alpaca_api_key_id.get_secret_value() if settings.alpaca_api_key_id else None
+        api_secret_key = settings.alpaca_api_secret_key.get_secret_value() if settings.alpaca_api_secret_key else None
+        marketaux_api_token = (
+            settings.marketaux_api_token.get_secret_value() if settings.marketaux_api_token else None
+        )
+        news_cache = (
+            NewsCacheStore(settings.research.news_cache_database_path)
+            if settings.research.news_cache_enabled
+            else None
+        )
+        self.news = MarketNews(
+            api_key_id,
+            api_secret_key,
+            marketaux_api_token,
+            cache_store=news_cache,
+            cache_ttl_seconds=settings.research.news_cache_ttl_seconds,
+            provider_daily_limits={
+                "marketaux": settings.research.marketaux_daily_call_limit,
+                "alpaca": settings.research.alpaca_news_daily_call_limit,
+                "yahoo": settings.research.yahoo_news_daily_call_limit,
+            },
+        )
         self.sec = SecClient(settings.sec_user_agent)
         self.crypto = CryptoResearchService(settings)
 
@@ -21,7 +42,7 @@ class ResearchService:
             crypto_task = self.crypto.research(symbol)
             try:
                 news = await self.news.headlines(
-                    symbol.replace("/", "-"),
+                    symbol,
                     self.settings.research.news_headline_limit,
                 )
                 notes = ["Crypto asset; SEC company facts skipped."]
