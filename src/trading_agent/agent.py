@@ -12,6 +12,7 @@ from rich.table import Table
 from trading_agent.audit import AuditStore, start_of_trading_day
 from trading_agent.broker_sync import BrokerOrderSync
 from trading_agent.brokers.alpaca import AlpacaBroker
+from trading_agent.catalyst.service import CatalystEngine
 from trading_agent.config import Settings
 from trading_agent.models import (
     AssetClass,
@@ -57,6 +58,7 @@ class TradingAgent:
         self.research = ResearchService(settings)
         self.momentum = MomentumStrategy(settings)
         self.options = OptionsStrategy(settings)
+        self.catalyst = CatalystEngine(settings)
         self.audit = AuditStore(settings.audit.database_path) if settings.audit.enabled else None
         self.broker_sync = BrokerOrderSync(self.broker, self.audit, self.console) if self.audit else None
         self.position_manager = PositionManager(settings, self.audit)
@@ -64,6 +66,7 @@ class TradingAgent:
         self.screener = MarketScreener(settings, self.broker)
 
     async def run_once(self) -> list[RiskDecision]:
+        analysis_time = datetime.now().astimezone()
         account = await self.broker.get_account()
         positions = await self.broker.get_positions()
         cycle_id = self.audit.start_cycle(account, positions) if self.audit else None
@@ -99,7 +102,7 @@ class TradingAgent:
             decisions = [self.risk.evaluate(candidate, account, positions) for candidate in candidates]
             for decision in decisions:
                 self._audit_decision(cycle_id, decision)
-            self._print_decisions(account, decisions)
+            self._print_decisions(account, decisions, analysis_time)
 
             if self.settings.agent.execute_orders:
                 await self._submit_decisions(decisions, account, cycle_id, positions)
@@ -143,17 +146,44 @@ class TradingAgent:
                 symbol=research.symbol,
                 status="captured",
             )
-            symbol_candidates = self.momentum.evaluate(market, research)
+            prediction = self.catalyst.evaluate(market, research)
+            if self.settings.catalyst.enabled:
+                self._audit_event(
+                    cycle_id,
+                    "catalyst_prediction",
+                    prediction,
+                    symbol=market.symbol,
+                    score=prediction.prediction_score,
+                    status=prediction.direction,
+                    reason=prediction.block_reason,
+                )
+
+            raw_symbol_candidates = self.momentum.evaluate(market, research)
+            catalyst_entry = self.catalyst.entry_candidate(market, prediction, raw_symbol_candidates)
+            if catalyst_entry:
+                raw_symbol_candidates.append(catalyst_entry)
+            symbol_candidates, blocked_candidates = self.catalyst.apply_to_candidates(
+                raw_symbol_candidates,
+                prediction,
+            )
             for candidate in symbol_candidates:
                 self._audit_candidate(cycle_id, candidate)
+            for candidate, reason in blocked_candidates:
+                self._audit_candidate(cycle_id, candidate, status="blocked", reason=reason)
             candidates.extend(symbol_candidates)
             if (
                 self.settings.strategy.allow_options
                 and market.asset_class in {AssetClass.EQUITY, AssetClass.ETF}
             ):
                 option_candidates = await self._option_candidates(market, positions, candidates)
+                option_candidates, blocked_options = self.catalyst.apply_to_candidates(
+                    option_candidates,
+                    prediction,
+                )
                 for candidate in option_candidates:
                     self._audit_candidate(cycle_id, candidate)
+                for candidate, reason in blocked_options:
+                    self._audit_candidate(cycle_id, candidate, status="blocked", reason=reason)
                 candidates.extend(option_candidates)
         return sorted(candidates, key=lambda candidate: candidate.score, reverse=True)
 
@@ -1093,9 +1123,15 @@ class TradingAgent:
             return None
         return float(close_price)
 
-    def _print_decisions(self, account, decisions: list[RiskDecision]) -> None:
+    def _print_decisions(
+        self,
+        account,
+        decisions: list[RiskDecision],
+        analysis_time: datetime | None = None,
+    ) -> None:
+        timestamp = (analysis_time or datetime.now().astimezone()).strftime("%Y-%m-%d %H:%M:%S %Z")
         self.console.print(
-            f"Equity ${account.equity:,.2f} | Cash ${account.cash:,.2f} | "
+            f"Analysis Time {timestamp} | Equity ${account.equity:,.2f} | Cash ${account.cash:,.2f} | "
             f"Buying Power ${account.buying_power:,.2f} | Daily P/L {account.daily_pl_pct:.2f}%"
         )
         table = Table("Approved", "Symbol", "Strategy", "Score", "Reason")
@@ -1109,7 +1145,14 @@ class TradingAgent:
             )
         self.console.print(table)
 
-    def _audit_candidate(self, cycle_id: int | None, candidate: TradeCandidate) -> None:
+    def _audit_candidate(
+        self,
+        cycle_id: int | None,
+        candidate: TradeCandidate,
+        *,
+        status: str = "generated",
+        reason: str | None = None,
+    ) -> None:
         self._audit_event(
             cycle_id,
             "trade_candidate",
@@ -1117,7 +1160,8 @@ class TradingAgent:
             symbol=candidate.symbol,
             strategy=candidate.strategy,
             score=candidate.score,
-            status="generated",
+            status=status,
+            reason=reason,
         )
 
     def _audit_decision(self, cycle_id: int | None, decision: RiskDecision) -> None:

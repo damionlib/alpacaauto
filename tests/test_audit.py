@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 from trading_agent.audit import AuditStore, start_of_trading_day
+from trading_agent.catalyst.models import CatalystPrediction
 from trading_agent.models import AccountSnapshot, AssetClass, MarketSnapshot, OrderIntent, OrderSide, Position
 
 
@@ -26,6 +27,38 @@ def test_audit_store_records_cycle_and_events(tmp_path) -> None:
     assert summary["cycle"]["status"] == "completed"
     assert summary["market_snapshots"][0]["symbol"] == "AAPL"
     assert summary["market_snapshots"][0]["payload"]["price"] == 200
+    assert summary["catalyst_predictions"] == []
+
+
+def test_audit_summary_includes_catalyst_predictions(tmp_path) -> None:
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    cycle_id = store.start_cycle(
+        AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000),
+        [],
+    )
+    store.record_event(
+        cycle_id=cycle_id,
+        event_type="catalyst_prediction",
+        payload=CatalystPrediction(
+            symbol="AAPL",
+            asset_class="equity",
+            direction="bullish",
+            prediction_score=82,
+            bullish_score=82,
+            confidence="medium",
+            entry_allowed=True,
+            market_regime="risk_on",
+        ),
+        symbol="AAPL",
+        score=82,
+        status="bullish",
+    )
+    store.finish_cycle(cycle_id)
+
+    summary = store.latest_summary()
+
+    assert summary["catalyst_predictions"][0]["symbol"] == "AAPL"
+    assert summary["catalyst_predictions"][0]["payload"]["prediction_score"] == 82
 
 
 def test_audit_store_preserves_existing_cycles_when_reopened(tmp_path) -> None:

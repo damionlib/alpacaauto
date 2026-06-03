@@ -63,6 +63,18 @@ min_avg_dollar_volume = 25000000.0
 max_realized_volatility_pct = 90.0
 min_trend_score = 45.0
 
+[catalyst]
+enabled = true
+min_trade_score = 65.0
+min_entry_score = 80.0
+score_weight = 0.35
+max_volatility_pct = 75.0
+generate_entry_candidates = true
+block_low_confidence = true
+block_rumor_only = true
+block_high_event_risk = true
+require_medium_confidence_for_options = true
+
 [research]
 news_headline_limit = 8
 sec_companyfacts_enabled = true

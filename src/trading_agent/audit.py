@@ -193,6 +193,7 @@ class AuditStore:
                 "orders": [],
                 "market_snapshots": [],
                 "research_results": [],
+                "catalyst_predictions": [],
             }
         cycle_id = int(cycle["id"])
         return {
@@ -201,6 +202,7 @@ class AuditStore:
             "orders": self.events(cycle_id=cycle_id, event_type="order", limit=500),
             "market_snapshots": self.events(cycle_id=cycle_id, event_type="market_snapshot", limit=500),
             "research_results": self.events(cycle_id=cycle_id, event_type="research_result", limit=500),
+            "catalyst_predictions": self.events(cycle_id=cycle_id, event_type="catalyst_prediction", limit=500),
         }
 
     def performance_report(self) -> dict[str, Any]:

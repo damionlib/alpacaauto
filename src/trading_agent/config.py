@@ -84,6 +84,19 @@ class ScreenerConfig(BaseModel):
     min_trend_score: float = Field(default=45.0, ge=0, le=100)
 
 
+class CatalystConfig(BaseModel):
+    enabled: bool = True
+    min_trade_score: float = Field(default=65.0, ge=0, le=100)
+    min_entry_score: float = Field(default=80.0, ge=0, le=100)
+    score_weight: float = Field(default=0.35, ge=0, le=1)
+    max_volatility_pct: float = Field(default=75.0, gt=0, le=200)
+    generate_entry_candidates: bool = True
+    block_low_confidence: bool = True
+    block_rumor_only: bool = True
+    block_high_event_risk: bool = True
+    require_medium_confidence_for_options: bool = True
+
+
 class ResearchConfig(BaseModel):
     news_headline_limit: int = Field(default=8, ge=0, le=50)
     sec_companyfacts_enabled: bool = True
@@ -101,6 +114,7 @@ class Settings(BaseModel):
     risk: RiskConfig = Field(default_factory=RiskConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     screener: ScreenerConfig = Field(default_factory=ScreenerConfig)
+    catalyst: CatalystConfig = Field(default_factory=CatalystConfig)
     research: ResearchConfig = Field(default_factory=ResearchConfig)
     alpaca_api_key_id: SecretStr | None = None
     alpaca_api_secret_key: SecretStr | None = None

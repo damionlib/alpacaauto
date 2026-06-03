@@ -227,6 +227,9 @@ DASHBOARD_HTML = r"""<!doctype html>
     .helping { color: var(--ok); border-color: rgba(6, 118, 71, 0.35); }
     .hurting { color: var(--danger); border-color: rgba(180, 35, 24, 0.35); }
     .neutral, .needs_data { color: var(--warn); border-color: rgba(181, 71, 8, 0.35); }
+    .bullish, .high { color: var(--ok); border-color: rgba(6, 118, 71, 0.35); }
+    .bearish, .low { color: var(--danger); border-color: rgba(180, 35, 24, 0.35); }
+    .medium { color: var(--warn); border-color: rgba(181, 71, 8, 0.35); }
     .hidden { display: none; }
     .empty {
       background: var(--surface);
@@ -276,6 +279,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <nav class="tabs">
       <button class="tab active" data-tab="decisions">Trade Decisions</button>
       <button class="tab" data-tab="orders">Orders</button>
+      <button class="tab" data-tab="catalyst">Catalyst</button>
       <button class="tab" data-tab="performance">Performance</button>
       <button class="tab" data-tab="market">Market</button>
       <button class="tab" data-tab="research">Research</button>
@@ -283,6 +287,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     </nav>
     <section id="decisions" class="panel"></section>
     <section id="orders" class="panel hidden"></section>
+    <section id="catalyst" class="panel hidden"></section>
     <section id="performance" class="panel hidden"></section>
     <section id="market" class="panel hidden"></section>
     <section id="research" class="panel hidden"></section>
@@ -293,6 +298,7 @@ DASHBOARD_HTML = r"""<!doctype html>
             <option value="">All events</option>
             <option value="market_snapshot">Market snapshots</option>
             <option value="research_result">Research results</option>
+            <option value="catalyst_prediction">Catalyst predictions</option>
             <option value="trade_candidate">Trade candidates</option>
             <option value="risk_decision">Risk decisions</option>
             <option value="order">Orders</option>
@@ -375,6 +381,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         const candidate = payload(event).candidate || {};
         const intent = payload(event).intent || {};
         return {
+          time: esc(fmtDate(event.created_at)),
           approved: statusPill(event.approved ? "approved" : "rejected"),
           symbol: esc(event.symbol),
           strategy: esc(event.strategy),
@@ -386,6 +393,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         };
       });
       renderTable("decisions", [
+        { key: "time", label: "Time" },
         { key: "approved", label: "Approved" },
         { key: "symbol", label: "Symbol" },
         { key: "strategy", label: "Strategy" },
@@ -423,6 +431,35 @@ DASHBOARD_HTML = r"""<!doctype html>
         { key: "time", label: "Time" },
       ], rows, "No submitted or rejected orders recorded yet.");
     }
+    function renderCatalyst(summary) {
+      const rows = (summary.catalyst_predictions || []).slice().reverse().map(event => {
+        const data = payload(event);
+        return {
+          time: esc(fmtDate(event.created_at)),
+          direction: statusPill(data.direction || event.status || ""),
+          symbol: esc(event.symbol),
+          horizon: esc(data.horizon || ""),
+          score: esc(Number(data.prediction_score || event.score || 0).toFixed(2)),
+          bullish: esc(Number(data.bullish_score || 0).toFixed(2)),
+          confidence: statusPill(data.confidence || ""),
+          allowed: statusPill(data.entry_allowed ? "approved" : "rejected"),
+          evidence: `<div class="detail">${esc((data.evidence || []).join(" | "))}</div>`,
+          risks: `<div class="detail">${esc((data.risks || []).join(" | ") || data.block_reason || "")}</div>`,
+        };
+      });
+      renderTable("catalyst", [
+        { key: "time", label: "Time" },
+        { key: "direction", label: "Direction" },
+        { key: "symbol", label: "Symbol" },
+        { key: "horizon", label: "Horizon" },
+        { key: "score", label: "Prediction", cls: "num" },
+        { key: "bullish", label: "Bullish", cls: "num" },
+        { key: "confidence", label: "Confidence" },
+        { key: "allowed", label: "Entry Gate" },
+        { key: "evidence", label: "Evidence" },
+        { key: "risks", label: "Risks" },
+      ], rows, "No Catalyst Engine predictions recorded yet.");
+    }
     function renderPerformance(report) {
       const summary = report.summary || {};
       const warnings = report.data_quality?.warnings || [];
@@ -459,7 +496,9 @@ DASHBOARD_HTML = r"""<!doctype html>
         { key: "orders", label: "Submitted / Rejected / Skipped", cls: "num" },
       ];
 
+      const asOf = fmtDate(state.summary?.cycle?.started_at || "");
       const positionRows = (report.open_positions || []).map(row => ({
+        asOf: esc(asOf),
         symbol: esc(row.symbol),
         strategy: esc(row.strategy),
         assetClass: esc(row.asset_class),
@@ -486,6 +525,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       `;
       renderTable("strategyPerformance", strategyHeaders, strategyRows, "No strategy performance data yet.");
       renderTable("openPositionPerformance", [
+        { key: "asOf", label: "As Of" },
         { key: "symbol", label: "Symbol" },
         { key: "strategy", label: "Strategy" },
         { key: "assetClass", label: "Class" },
@@ -504,6 +544,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       const rows = (summary.market_snapshots || []).map(event => {
         const data = payload(event);
         return {
+          time: esc(fmtDate(event.created_at)),
           symbol: esc(event.symbol),
           assetClass: esc(data.asset_class),
           price: esc(data.price),
@@ -512,6 +553,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         };
       });
       renderTable("market", [
+        { key: "time", label: "Time" },
         { key: "symbol", label: "Symbol" },
         { key: "assetClass", label: "Class" },
         { key: "price", label: "Price", cls: "num" },
@@ -527,6 +569,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         const regime = data.crypto_summary?.regime;
         const cryptoText = regime ? `${regime.label} ${regime.score}` : "";
         return {
+          time: esc(fmtDate(event.created_at)),
           symbol: esc(event.symbol),
           entity: esc(data.sec_summary?.entity_name || ""),
           crypto: esc(cryptoText),
@@ -536,6 +579,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         };
       });
       renderTable("research", [
+        { key: "time", label: "Time" },
         { key: "symbol", label: "Symbol" },
         { key: "entity", label: "Entity" },
         { key: "crypto", label: "Crypto Regime" },
@@ -550,6 +594,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       renderMetrics(state.summary);
       renderDecisions(state.summary);
       renderOrders(state.summary);
+      renderCatalyst(state.summary);
       renderMarket(state.summary);
       renderResearch(state.summary);
       document.getElementById("refreshMeta").textContent = `Updated ${new Date().toLocaleTimeString()} • Auto-refreshing every 10s`;
