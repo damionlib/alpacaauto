@@ -392,12 +392,13 @@ class TradingAgent:
     ) -> list[dict]:
         if not decision.intent:
             return []
-        symbol = decision.intent.symbol
-        if symbol not in open_orders["symbols"]:
+        symbols = self._decision_order_symbols(decision)
+        if not symbols.intersection(open_orders["symbols"]):
             return []
         canceled: list[dict] = []
         for order in open_orders["orders"]:
-            if str(order.get("symbol") or "") != symbol:
+            order_symbol = str(order.get("symbol") or "")
+            if order_symbol not in symbols:
                 continue
             order_id = str(order.get("id") or "")
             if not order_id:
@@ -411,14 +412,27 @@ class TradingAgent:
             self._audit_event(
                 cycle_id,
                 "order",
-                {"canceled_order_id": order_id, "symbol": symbol},
-                symbol=symbol,
+                {"canceled_order_id": order_id, "symbol": order_symbol},
+                symbol=order_symbol,
                 strategy=decision.candidate.strategy,
                 status="canceled",
                 reason="Canceled resting order so the position exit can be submitted.",
             )
-        open_orders["symbols"].discard(symbol)
+        open_orders["symbols"].difference_update(symbols)
         return canceled
+
+    def _decision_order_symbols(self, decision: RiskDecision) -> set[str]:
+        if not decision.intent:
+            return set()
+        symbols = {decision.intent.symbol}
+        for leg in decision.intent.legs:
+            symbol = str(leg.get("symbol") or "")
+            if symbol:
+                symbols.add(symbol)
+        for symbol in decision.candidate.metadata.get("paired_symbols") or []:
+            if symbol:
+                symbols.add(str(symbol))
+        return symbols
 
     def _is_conflict_error(self, exc: Exception) -> bool:
         text = str(exc).lower()

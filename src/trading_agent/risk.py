@@ -49,6 +49,9 @@ class RiskEngine:
         candidate: TradeCandidate,
         positions: list[Position],
     ) -> RiskDecision:
+        if candidate.metadata.get("spread_exit"):
+            return self._evaluate_spread_exit(candidate, positions)
+
         position = self._position(candidate.symbol, positions)
         if not position:
             return self._reject(candidate, "No existing position found to close.")
@@ -80,6 +83,49 @@ class RiskEngine:
             metadata=candidate.metadata,
         )
         return RiskDecision(approved=True, reason="Approved position exit.", intent=intent, candidate=candidate)
+
+    def _evaluate_spread_exit(
+        self,
+        candidate: TradeCandidate,
+        positions: list[Position],
+    ) -> RiskDecision:
+        legs = candidate.metadata.get("legs") or []
+        if not legs:
+            return self._reject(candidate, "Spread exit requires close legs.")
+        requested_qty = int(float(candidate.metadata.get("exit_qty") or 1))
+        if requested_qty < 1:
+            return self._reject(candidate, "Calculated spread close quantity is below 1.")
+
+        for leg in legs:
+            symbol = str(leg.get("symbol") or "")
+            side = str(leg.get("side") or "")
+            position = self._position(symbol, positions)
+            if not position:
+                return self._reject(candidate, f"No existing spread leg found to close: {symbol}.")
+            if side == "sell" and position.qty <= 0:
+                return self._reject(candidate, f"Spread leg {symbol} is not a long leg.")
+            if side == "buy" and position.qty >= 0:
+                return self._reject(candidate, f"Spread leg {symbol} is not a short leg.")
+            if abs(position.qty) < requested_qty:
+                return self._reject(candidate, f"Spread leg {symbol} has insufficient quantity to close.")
+
+        if candidate.entry_price <= 0:
+            return self._reject(candidate, "Spread close requires a positive net credit price.")
+
+        intent = OrderIntent(
+            symbol=candidate.symbol,
+            asset_class=AssetClass.OPTION,
+            side=candidate.side,
+            qty=requested_qty,
+            order_type=OrderType.LIMIT,
+            time_in_force=TimeInForce.DAY,
+            limit_price=round(candidate.entry_price, 2),
+            order_class="mleg",
+            legs=legs,
+            client_order_id=self._client_order_id(candidate),
+            metadata=candidate.metadata,
+        )
+        return RiskDecision(approved=True, reason="Approved multi-leg position exit.", intent=intent, candidate=candidate)
 
     def _evaluate_spot(
         self,

@@ -233,6 +233,63 @@ def test_option_exit_uses_limit_order() -> None:
     assert decision.intent.limit_price == 2.25
 
 
+def test_spread_exit_builds_mleg_close_order() -> None:
+    settings = Settings()
+    engine = RiskEngine(settings)
+    decision = engine.evaluate(
+        TradeCandidate(
+            symbol="NVDA_call_debit_spread",
+            asset_class=AssetClass.OPTION,
+            side=OrderSide.SELL,
+            strategy="spread_stop_loss_exit",
+            score=100,
+            entry_price=2.25,
+            metadata={
+                "exit": True,
+                "spread_exit": True,
+                "exit_qty": 1,
+                "legs": [
+                    {
+                        "symbol": "NVDA260617C00225000",
+                        "ratio_qty": "1",
+                        "side": "sell",
+                        "position_intent": "sell_to_close",
+                    },
+                    {
+                        "symbol": "NVDA260617C00240000",
+                        "ratio_qty": "1",
+                        "side": "buy",
+                        "position_intent": "buy_to_close",
+                    },
+                ],
+            },
+        ),
+        AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000, last_equity=100_000),
+        [
+            Position(
+                symbol="NVDA260617C00225000",
+                asset_class=AssetClass.OPTION,
+                qty=1,
+                market_value=330,
+            ),
+            Position(
+                symbol="NVDA260617C00240000",
+                asset_class=AssetClass.OPTION,
+                qty=-1,
+                market_value=-105,
+            ),
+        ],
+    )
+
+    assert decision.approved
+    assert decision.reason == "Approved multi-leg position exit."
+    assert decision.intent is not None
+    assert decision.intent.order_class == "mleg"
+    assert decision.intent.limit_price == 2.25
+    assert decision.intent.legs[0]["position_intent"] == "sell_to_close"
+    assert decision.intent.legs[1]["position_intent"] == "buy_to_close"
+
+
 def _covered_call_candidate(symbol: str, strike: str) -> TradeCandidate:
     return TradeCandidate(
         symbol=symbol,
