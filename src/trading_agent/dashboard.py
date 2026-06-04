@@ -36,11 +36,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             limit = self._int_param(params, "limit", 200)
             cycle_id = self._optional_int_param(params, "cycle_id")
             event_type = params.get("event_type", [None])[0] or None
+            symbol = params.get("symbol", [None])[0] or None
+            status = params.get("status", [None])[0] or None
+            trading_date = params.get("trading_date", [None])[0] or None
             self._send_json(
                 {
                     "events": self.server.store.events(
                         cycle_id=cycle_id,
                         event_type=event_type,
+                        symbol=symbol,
+                        status=status,
+                        trading_date=trading_date,
                         limit=limit,
                     )
                 }
@@ -179,7 +185,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       justify-content: space-between;
       margin: 14px 0 10px;
     }
-    select, button {
+    select, input, button {
       background: var(--surface);
       border: 1px solid var(--line);
       border-radius: 6px;
@@ -189,6 +195,14 @@ DASHBOARD_HTML = r"""<!doctype html>
       padding: 6px 10px;
     }
     button { cursor: pointer; }
+    input { min-width: 220px; text-transform: uppercase; }
+    .filterbar {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 10px;
+    }
     table {
       border-collapse: collapse;
       background: var(--surface);
@@ -227,6 +241,9 @@ DASHBOARD_HTML = r"""<!doctype html>
     .helping { color: var(--ok); border-color: rgba(6, 118, 71, 0.35); }
     .hurting { color: var(--danger); border-color: rgba(180, 35, 24, 0.35); }
     .neutral, .needs_data { color: var(--warn); border-color: rgba(181, 71, 8, 0.35); }
+    .bullish, .high { color: var(--ok); border-color: rgba(6, 118, 71, 0.35); }
+    .bearish, .low { color: var(--danger); border-color: rgba(180, 35, 24, 0.35); }
+    .medium { color: var(--warn); border-color: rgba(181, 71, 8, 0.35); }
     .hidden { display: none; }
     .empty {
       background: var(--surface);
@@ -276,13 +293,26 @@ DASHBOARD_HTML = r"""<!doctype html>
     <nav class="tabs">
       <button class="tab active" data-tab="decisions">Trade Decisions</button>
       <button class="tab" data-tab="orders">Orders</button>
+      <button class="tab" data-tab="dayTrading">Day Trading</button>
+      <button class="tab" data-tab="catalyst">Catalyst</button>
       <button class="tab" data-tab="performance">Performance</button>
       <button class="tab" data-tab="market">Market</button>
       <button class="tab" data-tab="research">Research</button>
       <button class="tab" data-tab="audit">Audit History</button>
     </nav>
+    <div class="toolbar filterbar" id="symbolFilterBar">
+      <div>
+        <input id="symbolFilter" type="text" placeholder="Filter symbol, e.g. HON or AAPL260617C00305000" autocomplete="off">
+        <input id="dateFilter" type="date" aria-label="Filter trading date">
+        <button id="applySymbolFilter">Apply</button>
+        <button id="clearSymbolFilter">Clear</button>
+      </div>
+      <div class="meta" id="symbolFilterMeta">Showing latest cycle</div>
+    </div>
     <section id="decisions" class="panel"></section>
     <section id="orders" class="panel hidden"></section>
+    <section id="dayTrading" class="panel hidden"></section>
+    <section id="catalyst" class="panel hidden"></section>
     <section id="performance" class="panel hidden"></section>
     <section id="market" class="panel hidden"></section>
     <section id="research" class="panel hidden"></section>
@@ -293,11 +323,29 @@ DASHBOARD_HTML = r"""<!doctype html>
             <option value="">All events</option>
             <option value="market_snapshot">Market snapshots</option>
             <option value="research_result">Research results</option>
+            <option value="catalyst_prediction">Catalyst predictions</option>
+            <option value="day_trade_signal">Day-trade signals</option>
             <option value="trade_candidate">Trade candidates</option>
             <option value="risk_decision">Risk decisions</option>
             <option value="order">Orders</option>
             <option value="broker_order_update">Broker order updates</option>
             <option value="risk_stop">Risk stops</option>
+          </select>
+          <select id="eventStatus">
+            <option value="">All statuses</option>
+            <option value="approved">Approved</option>
+            <option value="rejected">Rejected</option>
+            <option value="submitted">Submitted</option>
+            <option value="skipped">Skipped</option>
+            <option value="filled">Filled</option>
+            <option value="captured">Captured</option>
+            <option value="generated">Generated</option>
+            <option value="blocked">Blocked</option>
+            <option value="bullish">Bullish</option>
+            <option value="bearish">Bearish</option>
+            <option value="failed">Failed</option>
+            <option value="canceled">Canceled</option>
+            <option value="triggered">Triggered</option>
           </select>
           <button id="reloadAudit">Refresh</button>
         </div>
@@ -307,7 +355,15 @@ DASHBOARD_HTML = r"""<!doctype html>
     </section>
   </main>
   <script>
-    const state = { summary: null, performance: null, auditEvents: [] };
+    const state = {
+      summary: null,
+      performance: null,
+      auditEvents: [],
+      symbolFilter: "",
+      dateFilter: "",
+      symbolData: null,
+      dateData: null,
+    };
     const currency = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 
     function fmtMoney(value) {
@@ -337,6 +393,100 @@ DASHBOARD_HTML = r"""<!doctype html>
     }
     function payload(event) {
       return event.payload || {};
+    }
+    function displaySummary() {
+      if (state.dateFilter && state.dateData) return state.dateData;
+      if (!state.symbolFilter || !state.symbolData) return state.summary || {};
+      return { ...(state.summary || {}), ...state.symbolData };
+    }
+    function updateSymbolFilterMeta() {
+      const meta = document.getElementById("symbolFilterMeta");
+      if (!state.symbolFilter) {
+        meta.textContent = state.dateFilter ? `Showing events from ${state.dateFilter}` : "Showing latest cycle";
+        return;
+      }
+      const dateText = state.dateFilter ? ` on ${state.dateFilter}` : "";
+      meta.textContent = `Filtering exact event symbol ${state.symbolFilter}${dateText}`;
+    }
+    function syncFilterbarVisibility(activeTab) {
+      const filterbar = document.getElementById("symbolFilterBar");
+      filterbar.classList.toggle("hidden", activeTab === "performance");
+    }
+    async function fetchEventList(params) {
+      const query = new URLSearchParams({ limit: "500", ...params });
+      if (state.dateFilter) query.set("trading_date", state.dateFilter);
+      const response = await fetch(`/api/events?${query.toString()}`, { cache: "no-store" });
+      const data = await response.json();
+      return data.events || [];
+    }
+    async function loadDateData() {
+      if (!state.dateFilter) {
+        state.dateData = null;
+        return;
+      }
+      const symbolParams = state.symbolFilter ? { symbol: state.symbolFilter } : {};
+      const [
+        decisions,
+        orders,
+        marketSnapshots,
+        researchResults,
+        catalystPredictions,
+        dayTradeSignals,
+      ] = await Promise.all([
+        fetchEventList({ ...symbolParams, event_type: "risk_decision" }),
+        fetchEventList({ ...symbolParams, event_type: "order" }),
+        fetchEventList({ ...symbolParams, event_type: "market_snapshot" }),
+        fetchEventList({ ...symbolParams, event_type: "research_result" }),
+        fetchEventList({ ...symbolParams, event_type: "catalyst_prediction" }),
+        fetchEventList({ ...symbolParams, event_type: "day_trade_signal" }),
+      ]);
+      state.dateData = {
+        cycle: state.summary?.cycle || null,
+        decisions,
+        orders,
+        market_snapshots: marketSnapshots,
+        research_results: researchResults,
+        catalyst_predictions: catalystPredictions,
+        day_trade_signals: dayTradeSignals,
+      };
+    }
+    async function loadSymbolData() {
+      if (!state.symbolFilter) {
+        state.symbolData = null;
+        updateSymbolFilterMeta();
+        return;
+      }
+      const symbol = state.symbolFilter;
+      const [
+        decisions,
+        orders,
+        marketSnapshots,
+        researchResults,
+        catalystPredictions,
+      ] = await Promise.all([
+        fetchEventList({ symbol, event_type: "risk_decision" }),
+        fetchEventList({ symbol, event_type: "order" }),
+        fetchEventList({ symbol, event_type: "market_snapshot" }),
+        fetchEventList({ symbol, event_type: "research_result" }),
+        fetchEventList({ symbol, event_type: "catalyst_prediction" }),
+      ]);
+      state.symbolData = {
+        decisions,
+        orders,
+        market_snapshots: marketSnapshots,
+        research_results: researchResults,
+        catalyst_predictions: catalystPredictions,
+      };
+      updateSymbolFilterMeta();
+    }
+    function renderMainTables() {
+      const summary = displaySummary();
+      renderDecisions(summary);
+      renderOrders(summary);
+      renderDayTrading(summary);
+      renderCatalyst(summary);
+      renderMarket(summary);
+      renderResearch(summary);
     }
     function renderTable(containerId, headers, rows, emptyText) {
       const container = document.getElementById(containerId);
@@ -375,6 +525,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         const candidate = payload(event).candidate || {};
         const intent = payload(event).intent || {};
         return {
+          time: esc(fmtDate(event.created_at)),
           approved: statusPill(event.approved ? "approved" : "rejected"),
           symbol: esc(event.symbol),
           strategy: esc(event.strategy),
@@ -386,6 +537,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         };
       });
       renderTable("decisions", [
+        { key: "time", label: "Time" },
         { key: "approved", label: "Approved" },
         { key: "symbol", label: "Symbol" },
         { key: "strategy", label: "Strategy" },
@@ -423,6 +575,119 @@ DASHBOARD_HTML = r"""<!doctype html>
         { key: "time", label: "Time" },
       ], rows, "No submitted or rejected orders recorded yet.");
     }
+    function renderDayTrading(summary) {
+      const signals = summary.day_trade_signals || [];
+      const decisions = (summary.decisions || []).filter(event => String(event.strategy || "").startsWith("day_trade"));
+      const orders = (summary.orders || []).filter(event => String(event.strategy || "").startsWith("day_trade"));
+      const signalRows = signals.slice().reverse().map(event => {
+        const data = payload(event);
+        return {
+          time: esc(fmtDate(event.created_at)),
+          status: statusPill(event.status),
+          symbol: esc(event.symbol),
+          kind: esc(data.kind || ""),
+          setup: esc(data.setup || ""),
+          combined: esc(Number(data.combined_score || 0).toFixed(2)),
+          catalyst: esc(Number(data.catalyst_score || 0).toFixed(2)),
+          intraday: esc(Number(data.intraday_score || 0).toFixed(2)),
+          execution: esc(Number(data.execution_score || 0).toFixed(2)),
+          reason: `<div class="detail">${esc(event.reason || data.reason || "")}</div>`,
+        };
+      });
+      const decisionRows = decisions.slice().reverse().map(event => {
+        const candidate = payload(event).candidate || {};
+        const signal = candidate.metadata?.signal || {};
+        return {
+          time: esc(fmtDate(event.created_at)),
+          approved: statusPill(event.approved ? "approved" : "rejected"),
+          symbol: esc(event.symbol),
+          strategy: esc(event.strategy),
+          score: esc(Number(event.score || 0).toFixed(2)),
+          setup: esc(signal.setup || candidate.metadata?.setup || ""),
+          reason: `<div class="detail">${esc(event.reason || "")}</div>`,
+        };
+      });
+      const orderRows = orders.map(event => {
+        const data = payload(event);
+        const intent = data.intent || {};
+        return {
+          time: esc(fmtDate(event.created_at)),
+          status: statusPill(event.status),
+          symbol: esc(event.symbol),
+          strategy: esc(event.strategy),
+          side: esc(intent.side || ""),
+          qty: esc(intent.qty ?? ""),
+          reason: `<div class="detail">${esc(event.reason || data.error || "")}</div>`,
+        };
+      });
+      document.getElementById("dayTrading").innerHTML = `
+        <div class="toolbar"><div class="meta">Day-trade signals</div><div class="meta">Signals explain why the agent waited, entered, or exited.</div></div>
+        <div id="dayTradeSignals"></div>
+        <div class="toolbar"><div class="meta">Day-trade decisions</div></div>
+        <div id="dayTradeDecisions"></div>
+        <div class="toolbar"><div class="meta">Day-trade orders</div></div>
+        <div id="dayTradeOrders"></div>
+      `;
+      renderTable("dayTradeSignals", [
+        { key: "time", label: "Time" },
+        { key: "status", label: "Status" },
+        { key: "symbol", label: "Symbol" },
+        { key: "kind", label: "Kind" },
+        { key: "setup", label: "Setup" },
+        { key: "combined", label: "Combined", cls: "num" },
+        { key: "catalyst", label: "Catalyst", cls: "num" },
+        { key: "intraday", label: "Intraday", cls: "num" },
+        { key: "execution", label: "Execution", cls: "num" },
+        { key: "reason", label: "Reason" },
+      ], signalRows, "No day-trade signals recorded for this view.");
+      renderTable("dayTradeDecisions", [
+        { key: "time", label: "Time" },
+        { key: "approved", label: "Approved" },
+        { key: "symbol", label: "Symbol" },
+        { key: "strategy", label: "Strategy" },
+        { key: "score", label: "Score", cls: "num" },
+        { key: "setup", label: "Setup" },
+        { key: "reason", label: "Reason" },
+      ], decisionRows, "No day-trade decisions recorded for this view.");
+      renderTable("dayTradeOrders", [
+        { key: "time", label: "Time" },
+        { key: "status", label: "Status" },
+        { key: "symbol", label: "Symbol" },
+        { key: "strategy", label: "Strategy" },
+        { key: "side", label: "Side" },
+        { key: "qty", label: "Qty", cls: "num" },
+        { key: "reason", label: "Reason" },
+      ], orderRows, "No day-trade orders recorded for this view.");
+    }
+    function renderCatalyst(summary) {
+      const rows = (summary.catalyst_predictions || []).slice().reverse().map(event => {
+        const data = payload(event);
+        return {
+          time: esc(fmtDate(event.created_at)),
+          direction: statusPill(data.direction || event.status || ""),
+          symbol: esc(event.symbol),
+          horizon: esc(data.horizon || ""),
+          score: esc(Number(data.prediction_score || event.score || 0).toFixed(2)),
+          bullish: esc(Number(data.bullish_score || 0).toFixed(2)),
+          confidence: statusPill(data.confidence || ""),
+          allowed: statusPill(data.entry_allowed ? "approved" : "rejected"),
+          evidence: `<div class="detail">${esc((data.evidence || []).join(" | "))}</div>`,
+          risks: `<div class="detail">${esc((data.risks || []).join(" | ") || data.block_reason || "")}</div>`,
+        };
+      });
+      renderTable("catalyst", [
+        { key: "time", label: "Time" },
+        { key: "direction", label: "Direction" },
+        { key: "symbol", label: "Symbol" },
+        { key: "horizon", label: "Horizon" },
+        { key: "score", label: "Prediction", cls: "num" },
+        { key: "bullish", label: "Bullish", cls: "num" },
+        { key: "confidence", label: "Confidence" },
+        { key: "allowed", label: "Entry Gate" },
+        { key: "evidence", label: "Evidence" },
+        { key: "risks", label: "Risks" },
+      ], rows, "No Catalyst Engine predictions recorded yet.");
+    }
     function renderPerformance(report) {
       const summary = report.summary || {};
       const warnings = report.data_quality?.warnings || [];
@@ -459,7 +724,9 @@ DASHBOARD_HTML = r"""<!doctype html>
         { key: "orders", label: "Submitted / Rejected / Skipped", cls: "num" },
       ];
 
+      const asOf = fmtDate(state.summary?.cycle?.started_at || "");
       const positionRows = (report.open_positions || []).map(row => ({
+        asOf: esc(asOf),
         symbol: esc(row.symbol),
         strategy: esc(row.strategy),
         assetClass: esc(row.asset_class),
@@ -486,6 +753,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       `;
       renderTable("strategyPerformance", strategyHeaders, strategyRows, "No strategy performance data yet.");
       renderTable("openPositionPerformance", [
+        { key: "asOf", label: "As Of" },
         { key: "symbol", label: "Symbol" },
         { key: "strategy", label: "Strategy" },
         { key: "assetClass", label: "Class" },
@@ -504,6 +772,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       const rows = (summary.market_snapshots || []).map(event => {
         const data = payload(event);
         return {
+          time: esc(fmtDate(event.created_at)),
           symbol: esc(event.symbol),
           assetClass: esc(data.asset_class),
           price: esc(data.price),
@@ -512,6 +781,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         };
       });
       renderTable("market", [
+        { key: "time", label: "Time" },
         { key: "symbol", label: "Symbol" },
         { key: "assetClass", label: "Class" },
         { key: "price", label: "Price", cls: "num" },
@@ -527,6 +797,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         const regime = data.crypto_summary?.regime;
         const cryptoText = regime ? `${regime.label} ${regime.score}` : "";
         return {
+          time: esc(fmtDate(event.created_at)),
           symbol: esc(event.symbol),
           entity: esc(data.sec_summary?.entity_name || ""),
           crypto: esc(cryptoText),
@@ -536,6 +807,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         };
       });
       renderTable("research", [
+        { key: "time", label: "Time" },
         { key: "symbol", label: "Symbol" },
         { key: "entity", label: "Entity" },
         { key: "crypto", label: "Crypto Regime" },
@@ -548,16 +820,23 @@ DASHBOARD_HTML = r"""<!doctype html>
       const response = await fetch("/api/summary", { cache: "no-store" });
       state.summary = await response.json();
       renderMetrics(state.summary);
-      renderDecisions(state.summary);
-      renderOrders(state.summary);
-      renderMarket(state.summary);
-      renderResearch(state.summary);
+      if (state.dateFilter) {
+        await loadDateData();
+        updateSymbolFilterMeta();
+      } else {
+        await loadSymbolData();
+      }
+      renderMainTables();
       document.getElementById("refreshMeta").textContent = `Updated ${new Date().toLocaleTimeString()} • Auto-refreshing every 10s`;
     }
     async function loadAudit() {
       const eventType = document.getElementById("eventType").value;
+      const eventStatus = document.getElementById("eventStatus").value;
       const query = new URLSearchParams({ limit: "300" });
       if (eventType) query.set("event_type", eventType);
+      if (eventStatus) query.set("status", eventStatus);
+      if (state.symbolFilter) query.set("symbol", state.symbolFilter);
+      if (state.dateFilter) query.set("trading_date", state.dateFilter);
       const response = await fetch(`/api/events?${query.toString()}`, { cache: "no-store" });
       const data = await response.json();
       state.auditEvents = data.events || [];
@@ -593,15 +872,45 @@ DASHBOARD_HTML = r"""<!doctype html>
         document.querySelectorAll(".panel").forEach(item => item.classList.add("hidden"));
         tab.classList.add("active");
         document.getElementById(tab.dataset.tab).classList.remove("hidden");
+        syncFilterbarVisibility(tab.dataset.tab);
         if (tab.dataset.tab === "audit") loadAudit();
         if (tab.dataset.tab === "performance") loadPerformance();
       });
     });
     document.getElementById("reloadAudit").addEventListener("click", loadAudit);
     document.getElementById("eventType").addEventListener("change", loadAudit);
+    document.getElementById("eventStatus").addEventListener("change", loadAudit);
+    document.getElementById("applySymbolFilter").addEventListener("click", () => {
+      state.symbolFilter = document.getElementById("symbolFilter").value.trim().toUpperCase();
+      state.dateFilter = document.getElementById("dateFilter").value;
+      loadSummary();
+      if (!document.getElementById("audit").classList.contains("hidden")) loadAudit();
+    });
+    document.getElementById("clearSymbolFilter").addEventListener("click", () => {
+      document.getElementById("symbolFilter").value = "";
+      document.getElementById("dateFilter").value = "";
+      state.symbolFilter = "";
+      state.dateFilter = "";
+      state.symbolData = null;
+      state.dateData = null;
+      updateSymbolFilterMeta();
+      renderMainTables();
+      if (!document.getElementById("audit").classList.contains("hidden")) loadAudit();
+    });
+    document.getElementById("dateFilter").addEventListener("change", () => {
+      state.dateFilter = document.getElementById("dateFilter").value;
+      loadSummary();
+      if (!document.getElementById("audit").classList.contains("hidden")) loadAudit();
+    });
+    document.getElementById("symbolFilter").addEventListener("keydown", event => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      document.getElementById("applySymbolFilter").click();
+    });
     loadSummary().catch(error => {
       document.getElementById("cycleMeta").textContent = `Dashboard load failed: ${error}`;
     });
+    syncFilterbarVisibility("decisions");
     setInterval(() => {
       loadSummary();
       if (!document.getElementById("performance").classList.contains("hidden")) loadPerformance();

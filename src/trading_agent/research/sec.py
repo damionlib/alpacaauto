@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from functools import cached_property
+import asyncio
 from typing import Any
 
 import httpx
@@ -9,26 +9,34 @@ import httpx
 class SecClient:
     def __init__(self, user_agent: str) -> None:
         self.headers = {"User-Agent": user_agent, "Accept-Encoding": "gzip, deflate"}
+        self._ticker_map: dict[str, dict[str, Any]] | None = None
+        self._ticker_map_lock = asyncio.Lock()
 
-    @cached_property
-    def _ticker_map(self) -> dict[str, dict[str, Any]]:
-        response = httpx.get(
-            "https://www.sec.gov/files/company_tickers.json",
-            headers=self.headers,
-            timeout=30.0,
-        )
-        response.raise_for_status()
-        rows = response.json().values()
-        return {row["ticker"].upper(): row for row in rows}
+    async def _get_ticker_map(self) -> dict[str, dict[str, Any]]:
+        # Load the ~1 MB ticker file asynchronously and cache it for the process.
+        # A lock keeps concurrent first-time callers from each downloading it, and
+        # avoids the old synchronous httpx.get that blocked the whole event loop.
+        if self._ticker_map is not None:
+            return self._ticker_map
+        async with self._ticker_map_lock:
+            if self._ticker_map is not None:
+                return self._ticker_map
+            async with httpx.AsyncClient(timeout=30.0, headers=self.headers) as client:
+                response = await client.get("https://www.sec.gov/files/company_tickers.json")
+                response.raise_for_status()
+                rows = response.json().values()
+            self._ticker_map = {row["ticker"].upper(): row for row in rows}
+            return self._ticker_map
 
-    def get_cik(self, symbol: str) -> str | None:
-        row = self._ticker_map.get(symbol.upper())
+    async def get_cik(self, symbol: str) -> str | None:
+        ticker_map = await self._get_ticker_map()
+        row = ticker_map.get(symbol.upper())
         if not row:
             return None
         return f"{int(row['cik_str']):010d}"
 
     async def get_company_summary(self, symbol: str) -> dict[str, Any]:
-        cik = self.get_cik(symbol)
+        cik = await self.get_cik(symbol)
         if not cik:
             return {}
 

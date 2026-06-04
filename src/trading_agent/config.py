@@ -61,6 +61,7 @@ class RiskConfig(BaseModel):
     max_crypto_position_pct: float = Field(default=10.0, gt=0, le=100)
     max_options_premium_pct: float = Field(default=2.0, gt=0, le=10)
     min_cash_buffer_pct: float = Field(default=5.0, ge=0, le=50)
+    max_entry_slippage_pct: float = Field(default=0.5, ge=0, le=5)
 
 
 class StrategyConfig(BaseModel):
@@ -83,8 +84,47 @@ class ScreenerConfig(BaseModel):
     min_trend_score: float = Field(default=45.0, ge=0, le=100)
 
 
+class CatalystConfig(BaseModel):
+    enabled: bool = True
+    min_trade_score: float = Field(default=65.0, ge=0, le=100)
+    min_entry_score: float = Field(default=80.0, ge=0, le=100)
+    score_weight: float = Field(default=0.35, ge=0, le=1)
+    max_volatility_pct: float = Field(default=75.0, gt=0, le=200)
+    generate_entry_candidates: bool = True
+    block_low_confidence: bool = True
+    block_rumor_only: bool = True
+    block_high_event_risk: bool = True
+    require_medium_confidence_for_options: bool = True
+
+
+class DayTradingConfig(BaseModel):
+    enabled: bool = False
+    paper_only: bool = True
+    max_trades_per_day: int = Field(default=3, ge=0)
+    risk_per_trade_pct: float = Field(default=0.25, gt=0, le=5)
+    max_position_pct: float = Field(default=4.0, gt=0, le=25)
+    max_daily_loss_pct: float = Field(default=1.0, gt=0, le=10)
+    max_position_minutes: int = Field(default=120, ge=1)
+    force_exit_before_close_minutes: int = Field(default=15, ge=0)
+    min_catalyst_score: float = Field(default=65.0, ge=0, le=100)
+    min_intraday_score: float = Field(default=70.0, ge=0, le=100)
+    min_combined_score: float = Field(default=80.0, ge=0, le=100)
+    exit_intraday_score: float = Field(default=45.0, ge=0, le=100)
+    stop_loss_pct: float = Field(default=1.0, gt=0, le=10)
+    take_profit_pct: float = Field(default=2.0, gt=0, le=20)
+    trailing_stop_pct: float = Field(default=1.0, gt=0, le=10)
+    min_relative_volume: float = Field(default=1.2, ge=0)
+    max_spread_pct: float = Field(default=0.25, gt=0, le=5)
+
+
 class ResearchConfig(BaseModel):
     news_headline_limit: int = Field(default=8, ge=0, le=50)
+    news_cache_enabled: bool = True
+    news_cache_database_path: str = "data/news_cache.sqlite3"
+    news_cache_ttl_seconds: int = Field(default=1800, ge=0)
+    marketaux_daily_call_limit: int = Field(default=90, ge=0)
+    alpaca_news_daily_call_limit: int = Field(default=0, ge=0)
+    yahoo_news_daily_call_limit: int = Field(default=0, ge=0)
     sec_companyfacts_enabled: bool = True
     crypto_research_enabled: bool = True
     crypto_onchain_enabled: bool = False
@@ -100,9 +140,12 @@ class Settings(BaseModel):
     risk: RiskConfig = Field(default_factory=RiskConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     screener: ScreenerConfig = Field(default_factory=ScreenerConfig)
+    catalyst: CatalystConfig = Field(default_factory=CatalystConfig)
+    day_trading: DayTradingConfig = Field(default_factory=DayTradingConfig)
     research: ResearchConfig = Field(default_factory=ResearchConfig)
     alpaca_api_key_id: SecretStr | None = None
     alpaca_api_secret_key: SecretStr | None = None
+    marketaux_api_token: SecretStr | None = None
     allow_live_trading: bool = False
     sec_user_agent: str = "trading-agent your-email@example.com"
 
@@ -129,6 +172,7 @@ def load_settings(config_path: str | Path = "config/settings.toml") -> Settings:
     env_data = {
         "alpaca_api_key_id": os.getenv("ALPACA_API_KEY_ID"),
         "alpaca_api_secret_key": os.getenv("ALPACA_API_SECRET_KEY"),
+        "marketaux_api_token": os.getenv("MARKETAUX_API_TOKEN"),
         "allow_live_trading": os.getenv("ALLOW_LIVE_TRADING", "false").lower()
         in {"1", "true", "yes", "on"},
         "sec_user_agent": os.getenv("SEC_USER_AGENT", data.get("sec_user_agent")),

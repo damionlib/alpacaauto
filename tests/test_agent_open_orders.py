@@ -1,5 +1,12 @@
 from trading_agent.agent import TradingAgent
-from trading_agent.models import AssetClass, OrderIntent, OrderSide, RiskDecision, TradeCandidate
+from trading_agent.models import (
+    AssetClass,
+    OrderIntent,
+    OrderSide,
+    Position,
+    RiskDecision,
+    TradeCandidate,
+)
 
 
 def test_parse_option_symbol_extracts_underlying_and_type() -> None:
@@ -67,3 +74,47 @@ def _covered_call_decision(symbol: str) -> RiskDecision:
         ),
         candidate=candidate,
     )
+
+
+def _aapl_positions(short_calls: int) -> list[Position]:
+    positions = [Position(symbol="AAPL", asset_class=AssetClass.EQUITY, qty=228, market_value=72_000)]
+    if short_calls:
+        positions.append(
+            Position(
+                symbol="AAPL260612C00322500",
+                asset_class=AssetClass.OPTION,
+                qty=-short_calls,
+                market_value=-184 * short_calls,
+            )
+        )
+    return positions
+
+
+def test_skip_covered_call_when_existing_short_calls_use_coverage() -> None:
+    agent = TradingAgent.__new__(TradingAgent)
+    decision = _covered_call_decision("AAPL260612C00330000")
+
+    # 228 shares cover 2 calls; 1 is already written and 1 order is still working,
+    # so a third would overrun the coverage and create a naked call.
+    reason = agent._skip_due_to_open_orders(
+        decision,
+        {"symbols": set(), "covered_call_contracts_by_underlying": {"AAPL": 1}, "orders": []},
+        _aapl_positions(short_calls=1),
+    )
+
+    assert reason is not None
+    assert "already written" in reason
+
+
+def test_covered_call_allowed_when_coverage_remains_after_short_calls() -> None:
+    agent = TradingAgent.__new__(TradingAgent)
+    decision = _covered_call_decision("AAPL260612C00330000")
+
+    # 228 shares cover 2 calls, only 1 written and none working -> room for one more.
+    reason = agent._skip_due_to_open_orders(
+        decision,
+        {"symbols": set(), "covered_call_contracts_by_underlying": {}, "orders": []},
+        _aapl_positions(short_calls=1),
+    )
+
+    assert reason is None

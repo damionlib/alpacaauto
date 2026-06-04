@@ -15,7 +15,7 @@ live_max_total_orders_per_day = 6
 
 [audit]
 enabled = true
-database_path = "data/trading_agent.sqlite3"
+database_path = "data/trading_agent_paper_clean_20260602.sqlite3"
 
 [position_manager]
 enabled = true
@@ -34,6 +34,7 @@ max_position_pct = 12.0
 max_crypto_position_pct = 10.0
 max_options_premium_pct = 2.0
 min_cash_buffer_pct = 5.0
+max_entry_slippage_pct = 0.5
 
 [strategy]
 symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "BTC/USD", "ETH/USD"]
@@ -62,8 +63,45 @@ min_avg_dollar_volume = 25000000.0
 max_realized_volatility_pct = 90.0
 min_trend_score = 45.0
 
+[catalyst]
+enabled = true
+min_trade_score = 65.0
+min_entry_score = 80.0
+score_weight = 0.35
+max_volatility_pct = 75.0
+generate_entry_candidates = true
+block_low_confidence = true
+block_rumor_only = true
+block_high_event_risk = true
+require_medium_confidence_for_options = true
+
+[day_trading]
+enabled = false
+paper_only = true
+max_trades_per_day = 3
+risk_per_trade_pct = 0.25
+max_position_pct = 4.0
+max_daily_loss_pct = 1.0
+max_position_minutes = 120
+force_exit_before_close_minutes = 15
+min_catalyst_score = 65.0
+min_intraday_score = 70.0
+min_combined_score = 80.0
+exit_intraday_score = 45.0
+stop_loss_pct = 1.0
+take_profit_pct = 2.0
+trailing_stop_pct = 1.0
+min_relative_volume = 1.2
+max_spread_pct = 0.25
+
 [research]
 news_headline_limit = 8
+news_cache_enabled = true
+news_cache_database_path = "data/news_cache.sqlite3"
+news_cache_ttl_seconds = 1800
+marketaux_daily_call_limit = 90
+alpaca_news_daily_call_limit = 0
+yahoo_news_daily_call_limit = 0
 sec_companyfacts_enabled = true
 crypto_research_enabled = true
 crypto_onchain_enabled = false

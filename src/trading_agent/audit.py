@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -165,6 +165,9 @@ class AuditStore:
         *,
         cycle_id: int | None = None,
         event_type: str | None = None,
+        symbol: str | None = None,
+        status: str | None = None,
+        trading_date: str | None = None,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
         query = "select * from audit_events"
@@ -176,6 +179,16 @@ class AuditStore:
         if event_type:
             clauses.append("event_type = ?")
             params.append(event_type)
+        if symbol:
+            clauses.append("upper(symbol) = upper(?)")
+            params.append(symbol)
+        if status:
+            clauses.append("upper(status) = upper(?)")
+            params.append(status)
+        if trading_date:
+            start, end = self._trading_date_bounds(trading_date)
+            clauses.append("created_at >= ? and created_at < ?")
+            params.extend([start.isoformat(), end.isoformat()])
         if clauses:
             query += " where " + " and ".join(clauses)
         query += " order by id desc limit ?"
@@ -193,6 +206,8 @@ class AuditStore:
                 "orders": [],
                 "market_snapshots": [],
                 "research_results": [],
+                "catalyst_predictions": [],
+                "day_trade_signals": [],
             }
         cycle_id = int(cycle["id"])
         return {
@@ -201,6 +216,8 @@ class AuditStore:
             "orders": self.events(cycle_id=cycle_id, event_type="order", limit=500),
             "market_snapshots": self.events(cycle_id=cycle_id, event_type="market_snapshot", limit=500),
             "research_results": self.events(cycle_id=cycle_id, event_type="research_result", limit=500),
+            "catalyst_predictions": self.events(cycle_id=cycle_id, event_type="catalyst_prediction", limit=500),
+            "day_trade_signals": self.events(cycle_id=cycle_id, event_type="day_trade_signal", limit=500),
         }
 
     def performance_report(self) -> dict[str, Any]:
@@ -272,6 +289,42 @@ class AuditStore:
             "exit_orders": exit_orders,
         }
 
+    def day_trade_entries_since(self, since: datetime) -> list[dict[str, Any]]:
+        since_text = since.astimezone(UTC).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                select *
+                from audit_events
+                where event_type = 'order'
+                  and status = 'submitted'
+                  and strategy = 'day_trade_entry'
+                  and created_at >= ?
+                order by id desc
+                """,
+                (since_text,),
+            ).fetchall()
+        return [self._event_row(row) for row in rows]
+
+    def latest_day_trade_entry_for_symbol(self, symbol: str, since: datetime) -> dict[str, Any] | None:
+        since_text = since.astimezone(UTC).isoformat()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                select *
+                from audit_events
+                where event_type = 'order'
+                  and status = 'submitted'
+                  and strategy = 'day_trade_entry'
+                  and upper(symbol) = upper(?)
+                  and created_at >= ?
+                order by id desc
+                limit 1
+                """,
+                (symbol, since_text),
+            ).fetchone()
+        return self._event_row(row) if row else None
+
     def broker_order_update_exists(self, broker_order_id: str) -> bool:
         pattern = f'%"id": "{broker_order_id}"%'
         with self._connect() as connection:
@@ -280,6 +333,66 @@ class AuditStore:
                 select 1
                 from audit_events
                 where event_type = 'broker_order_update'
+                  and payload_json like ?
+                limit 1
+                """,
+                (pattern,),
+            ).fetchone()
+        return row is not None
+
+    def order_event_by_client_order_id(self, client_order_id: str) -> dict[str, Any] | None:
+        pattern = f'%"client_order_id": "{client_order_id}"%'
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                select *
+                from audit_events
+                where event_type = 'order'
+                  and status = 'submitted'
+                  and strategy != 'crypto_protective_stop'
+                  and payload_json like ?
+                order by id desc
+                limit 1
+                """,
+                (pattern,),
+            ).fetchone()
+        return self._event_row(row) if row else None
+
+    def protective_parent_for(self, protective_client_order_id: str) -> str | None:
+        if not protective_client_order_id:
+            return None
+        pattern = f'%"client_order_id": "{protective_client_order_id}"%'
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                select payload_json
+                from audit_events
+                where event_type = 'order'
+                  and strategy = 'crypto_protective_stop'
+                  and payload_json like ?
+                order by id desc
+                limit 1
+                """,
+                (pattern,),
+            ).fetchone()
+        if not row:
+            return None
+        payload = self._loads(row["payload_json"]) or {}
+        intent = payload.get("intent") or {}
+        metadata = intent.get("metadata") or {}
+        parent = metadata.get("parent_client_order_id")
+        return str(parent) if parent else None
+
+    def crypto_protective_stop_exists(self, parent_client_order_id: str) -> bool:
+        pattern = f'%"parent_client_order_id": "{parent_client_order_id}"%'
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                select 1
+                from audit_events
+                where event_type = 'order'
+                  and strategy = 'crypto_protective_stop'
+                  and status = 'submitted'
                   and payload_json like ?
                 limit 1
                 """,
@@ -377,6 +490,16 @@ class AuditStore:
             "reason": row["reason"],
             "payload": self._loads(row["payload_json"]),
         }
+
+    def _trading_date_bounds(self, trading_date: str) -> tuple[datetime, datetime]:
+        try:
+            parsed = date.fromisoformat(trading_date)
+        except ValueError:
+            parsed = datetime.now(UTC).date()
+        timezone = ZoneInfo("America/Chicago")
+        local_start = datetime.combine(parsed, time.min, tzinfo=timezone)
+        local_end = local_start + timedelta(days=1)
+        return local_start.astimezone(UTC), local_end.astimezone(UTC)
 
 
 def start_of_trading_day(

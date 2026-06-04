@@ -124,3 +124,80 @@ def test_position_manager_creates_short_option_stop_loss_exit() -> None:
     assert len(candidates) == 1
     assert candidates[0].side == OrderSide.BUY
     assert candidates[0].strategy == "short_option_stop_loss_exit"
+
+
+def test_position_manager_closes_debit_spread_as_one_order() -> None:
+    manager = PositionManager(Settings())
+
+    candidates = manager.evaluate(
+        [
+            Position(
+                symbol="NVDA260617C00225000",
+                asset_class=AssetClass.OPTION,
+                qty=1,
+                market_value=330,
+                avg_entry_price=10.25,
+                current_price=3.30,
+                unrealized_pl=-695,
+            ),
+            Position(
+                symbol="NVDA260617C00240000",
+                asset_class=AssetClass.OPTION,
+                qty=-1,
+                market_value=-105,
+                avg_entry_price=3.55,
+                current_price=1.05,
+                unrealized_pl=250,
+            ),
+        ]
+    )
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.symbol == "NVDA_call_debit_spread"
+    assert candidate.strategy == "spread_stop_loss_exit"
+    assert candidate.metadata["spread_exit"] is True
+    assert candidate.metadata["metrics"]["pnl_pct"] < -40
+    assert candidate.metadata["legs"] == [
+        {
+            "symbol": "NVDA260617C00225000",
+            "ratio_qty": "1",
+            "side": "sell",
+            "position_intent": "sell_to_close",
+        },
+        {
+            "symbol": "NVDA260617C00240000",
+            "ratio_qty": "1",
+            "side": "buy",
+            "position_intent": "buy_to_close",
+        },
+    ]
+
+
+def test_position_manager_does_not_close_one_losing_spread_leg() -> None:
+    manager = PositionManager(Settings())
+
+    candidates = manager.evaluate(
+        [
+            Position(
+                symbol="AAPL260617C00305000",
+                asset_class=AssetClass.OPTION,
+                qty=1,
+                market_value=1_105,
+                avg_entry_price=11.05,
+                current_price=11.05,
+                unrealized_pl=0,
+            ),
+            Position(
+                symbol="AAPL260617C00320000",
+                asset_class=AssetClass.OPTION,
+                qty=-1,
+                market_value=-295,
+                avg_entry_price=2.05,
+                current_price=2.95,
+                unrealized_pl=-90,
+            ),
+        ]
+    )
+
+    assert candidates == []

@@ -1,4 +1,56 @@
+import pytest
+
 from trading_agent.brokers.alpaca import AlpacaBroker
+
+
+@pytest.mark.anyio
+async def test_close_all_positions_calls_alpaca_endpoint() -> None:
+    broker = AlpacaBroker.__new__(AlpacaBroker)
+    broker.trading_base_url = "https://paper-api.alpaca.markets"
+    calls = []
+
+    async def fake_request(method, url, *, params=None, json=None):
+        calls.append((method, url, params, json))
+        return [{"symbol": "SPY"}]
+
+    broker._request = fake_request
+
+    result = await broker.close_all_positions(cancel_orders=True)
+
+    assert result == [{"symbol": "SPY"}]
+    assert calls == [
+        (
+            "DELETE",
+            "https://paper-api.alpaca.markets/v2/positions",
+            {"cancel_orders": "true"},
+            None,
+        )
+    ]
+
+
+@pytest.mark.anyio
+async def test_close_position_calls_alpaca_endpoint() -> None:
+    broker = AlpacaBroker.__new__(AlpacaBroker)
+    broker.trading_base_url = "https://paper-api.alpaca.markets"
+    calls = []
+
+    async def fake_request(method, url, *, params=None, json=None):
+        calls.append((method, url, params, json))
+        return {"symbol": "AAPL"}
+
+    broker._request = fake_request
+
+    result = await broker.close_position("AAPL")
+
+    assert result == {"symbol": "AAPL"}
+    assert calls == [
+        (
+            "DELETE",
+            "https://paper-api.alpaca.markets/v2/positions/AAPL",
+            None,
+            None,
+        )
+    ]
 
 
 def test_option_quote_midpoint_uses_bid_ask() -> None:

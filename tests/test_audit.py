@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 from trading_agent.audit import AuditStore, start_of_trading_day
+from trading_agent.catalyst.models import CatalystPrediction
 from trading_agent.models import AccountSnapshot, AssetClass, MarketSnapshot, OrderIntent, OrderSide, Position
 
 
@@ -26,6 +27,139 @@ def test_audit_store_records_cycle_and_events(tmp_path) -> None:
     assert summary["cycle"]["status"] == "completed"
     assert summary["market_snapshots"][0]["symbol"] == "AAPL"
     assert summary["market_snapshots"][0]["payload"]["price"] == 200
+    assert summary["catalyst_predictions"] == []
+    assert summary["day_trade_signals"] == []
+
+
+def test_audit_summary_includes_catalyst_predictions(tmp_path) -> None:
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    cycle_id = store.start_cycle(
+        AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000),
+        [],
+    )
+    store.record_event(
+        cycle_id=cycle_id,
+        event_type="catalyst_prediction",
+        payload=CatalystPrediction(
+            symbol="AAPL",
+            asset_class="equity",
+            direction="bullish",
+            prediction_score=82,
+            bullish_score=82,
+            confidence="medium",
+            entry_allowed=True,
+            market_regime="risk_on",
+        ),
+        symbol="AAPL",
+        score=82,
+        status="bullish",
+    )
+    store.finish_cycle(cycle_id)
+
+    summary = store.latest_summary()
+
+    assert summary["catalyst_predictions"][0]["symbol"] == "AAPL"
+    assert summary["catalyst_predictions"][0]["payload"]["prediction_score"] == 82
+
+
+def test_audit_summary_includes_day_trade_signals(tmp_path) -> None:
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    cycle_id = store.start_cycle(
+        AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000),
+        [],
+    )
+    store.record_event(
+        cycle_id=cycle_id,
+        event_type="day_trade_signal",
+        payload={"symbol": "AAPL", "combined_score": 86, "kind": "entry"},
+        symbol="AAPL",
+        score=86,
+        status="generated",
+    )
+    store.finish_cycle(cycle_id)
+
+    summary = store.latest_summary()
+
+    assert summary["day_trade_signals"][0]["symbol"] == "AAPL"
+    assert summary["day_trade_signals"][0]["payload"]["combined_score"] == 86
+
+
+def test_events_filter_by_exact_symbol_column_not_payload_text(tmp_path) -> None:
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    cycle_id = store.start_cycle(
+        AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000),
+        [],
+    )
+    store.record_event(
+        cycle_id=cycle_id,
+        event_type="order",
+        payload={"intent": {"symbol": "ORCL"}, "open_orders": [{"symbol": "HON"}]},
+        symbol="ORCL",
+        status="skipped",
+    )
+    store.record_event(
+        cycle_id=cycle_id,
+        event_type="risk_decision",
+        payload={"candidate": {"symbol": "HON"}},
+        symbol="HON",
+        status="approved",
+    )
+
+    hon_events = store.events(symbol="hon", limit=10)
+
+    assert [event["symbol"] for event in hon_events] == ["HON"]
+    assert hon_events[0]["event_type"] == "risk_decision"
+
+
+def test_events_filter_by_status(tmp_path) -> None:
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    cycle_id = store.start_cycle(
+        AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000),
+        [],
+    )
+    store.record_event(
+        cycle_id=cycle_id,
+        event_type="order",
+        payload={},
+        symbol="AAPL",
+        status="submitted",
+    )
+    store.record_event(
+        cycle_id=cycle_id,
+        event_type="order",
+        payload={},
+        symbol="MSFT",
+        status="rejected",
+    )
+
+    events = store.events(event_type="order", status="submitted", limit=10)
+
+    assert [event["symbol"] for event in events] == ["AAPL"]
+
+
+def test_events_filter_by_trading_date(tmp_path) -> None:
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    with store._connect() as connection:
+        connection.execute(
+            """
+            insert into audit_events
+                (cycle_id, created_at, event_type, symbol, strategy, approved, score, status, reason, payload_json)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (None, "2026-06-03T15:00:00+00:00", "day_trade_signal", "AAPL", None, None, 85, "generated", None, "{}"),
+        )
+        connection.execute(
+            """
+            insert into audit_events
+                (cycle_id, created_at, event_type, symbol, strategy, approved, score, status, reason, payload_json)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (None, "2026-06-04T15:00:00+00:00", "day_trade_signal", "MSFT", None, None, 82, "generated", None, "{}"),
+        )
+
+    events = store.events(event_type="day_trade_signal", trading_date="2026-06-03", limit=10)
+
+    assert [event["symbol"] for event in events] == ["AAPL"]
 
 
 def test_audit_store_preserves_existing_cycles_when_reopened(tmp_path) -> None:

@@ -152,10 +152,18 @@ class AlpacaBroker:
             payload["notional"] = round(intent.notional, 2)
         if intent.limit_price is not None:
             payload["limit_price"] = round(intent.limit_price, 2)
+        if intent.stop_price is not None:
+            payload["stop_price"] = round(intent.stop_price, 2)
         if intent.client_order_id:
             payload["client_order_id"] = intent.client_order_id
 
-        if intent.asset_class in {AssetClass.EQUITY, AssetClass.ETF}:
+        if intent.order_class == "oco":
+            payload["order_class"] = "oco"
+            if intent.take_profit_price is not None:
+                payload["take_profit"] = {"limit_price": round(intent.take_profit_price, 2)}
+            if intent.stop_loss_price is not None:
+                payload["stop_loss"] = {"stop_price": round(intent.stop_loss_price, 2)}
+        elif intent.asset_class in {AssetClass.EQUITY, AssetClass.ETF}:
             if intent.stop_loss_price and intent.take_profit_price:
                 payload["order_class"] = "bracket"
                 payload["stop_loss"] = {"stop_price": round(intent.stop_loss_price, 2)}
@@ -165,6 +173,19 @@ class AlpacaBroker:
 
     async def cancel_all_orders(self) -> list[dict]:
         return await self._request("DELETE", f"{self.trading_base_url}/v2/orders")
+
+    async def close_all_positions(self, *, cancel_orders: bool = True) -> list[dict]:
+        return await self._request(
+            "DELETE",
+            f"{self.trading_base_url}/v2/positions",
+            params={"cancel_orders": str(cancel_orders).lower()},
+        )
+
+    async def close_position(self, symbol: str) -> dict:
+        return await self._request("DELETE", f"{self.trading_base_url}/v2/positions/{symbol}")
+
+    async def cancel_order(self, order_id: str) -> None:
+        await self._request("DELETE", f"{self.trading_base_url}/v2/orders/{order_id}")
 
     async def get_open_orders(self) -> list[dict]:
         return await self._request(

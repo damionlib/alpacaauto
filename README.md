@@ -194,6 +194,30 @@ mode = "live"
 - Max stock/ETF position: 12% of equity
 - Max crypto position: 10% of equity
 - Max options premium per trade: 2% of equity
+- Max entry slippage: 0.5% (entries are submitted as marketable limit orders, not pure market orders, so a gap or thin quote cannot fill far from the price the sizing and stop math assumed)
+
+Per-trade caps are also enforced in aggregate across a single cycle: a shared cash
+budget (spendable balance minus the cash buffer) is decremented as each order is
+submitted, so the agent cannot approve several entries that each assume the full
+buffer.
+
+### Daily Loss Stop Behavior
+
+When the account is down more than `max_daily_loss_pct` from prior-day equity, the
+agent **halts new entries but keeps managing exits**. It no longer cancels all open
+orders on the stop: a blanket cancel would also remove the protective stop/take-profit
+legs of bracket orders, leaving open positions unguarded on the worst day. The
+position manager still runs and can trim or close losers.
+
+`trading-agent cancel-open-orders` remains as a manual kill switch if you want to
+clear all working orders yourself.
+
+### Crypto Protective Stops
+
+Alpaca does not support bracket orders for crypto, so after a crypto entry fills the
+agent rests a GTC stop-limit sell as a broker-side floor between position-manager
+polls. If the broker rejects it, the agent falls back to the position manager's
+software stop (which runs every cycle). Verify this in paper before relying on it.
 
 ## Cycle And Daily Order Caps
 
