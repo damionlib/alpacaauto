@@ -57,9 +57,11 @@ The dashboard shows:
 - latest account equity, cash, buying power, and cycle status
 - approved/rejected trade decisions with score and reason
 - submitted/rejected orders and broker response details
+- day-trading signals, decisions, and orders
 - market snapshots captured by the agent
 - research results from news and SEC company data
 - raw audit history with filters for review
+- date filtering so each trading day can be reviewed separately
 
 ## Position Manager
 
@@ -87,6 +89,71 @@ The position manager checks:
 - option-specific stop-loss/take-profit thresholds
 
 Exit candidates still pass through the risk engine before execution and are saved in the audit dashboard.
+
+## Day Trading
+
+Day trading is an optional paper-first mode for stock/ETF trades that are intended to be opened and closed the same day. It is disabled by default.
+
+Configured in `config/settings.toml`:
+
+```toml
+[day_trading]
+enabled = false
+paper_only = true
+max_trades_per_day = 3
+risk_per_trade_pct = 0.25
+max_position_pct = 4.0
+max_daily_loss_pct = 1.0
+max_position_minutes = 120
+force_exit_before_close_minutes = 15
+min_catalyst_score = 65.0
+min_intraday_score = 70.0
+min_combined_score = 80.0
+exit_intraday_score = 45.0
+stop_loss_pct = 1.0
+take_profit_pct = 2.0
+trailing_stop_pct = 1.0
+min_relative_volume = 1.2
+max_spread_pct = 0.25
+```
+
+The day-trading engine uses the existing research and Catalyst Engine output, then adds intraday and execution checks:
+
+- Catalyst score and direction
+- research/news quality and negative-news risk
+- intraday trend, VWAP, relative volume, opening-range flags, and short-term trend metadata when available
+- spread/execution quality
+- tighter day-trading risk sizing and daily-loss limits
+
+Day-trade entries still pass through the normal risk engine and broker execution path. Day-trade exits can be generated when:
+
+- the day-trade stop loss is hit
+- the take-profit threshold is hit
+- Catalyst flips bearish
+- intraday trend score drops below the exit threshold
+- max holding time is reached
+- the market is approaching close, so the position should not be held overnight
+
+### Swing/Day-Trade Conflict Protection
+
+Alpaca tracks one net position per symbol. If the account already holds 10 AAPL swing shares and the agent buys 10 more AAPL for day trading, the broker can show one 20-share AAPL position with an averaged cost basis. To avoid confusing exits, P/L, and audit records, the agent prevents same-symbol overlap:
+
+- if an existing position exists, the day-trade entry for that symbol is blocked
+- if swing and day-trade candidates appear for the same symbol in the same cycle, the swing candidate wins and the day trade is blocked
+- if a day-trade entry for a symbol has already been submitted today, later swing entries for that same symbol are blocked
+
+This policy is currently fixed and conservative; there is no `day_trade_conflict_policy` config variable.
+
+### Dashboard
+
+The dashboard includes a **Day Trading** tab with:
+
+- day-trade signals and setup scores
+- day-trade risk decisions
+- submitted/skipped/rejected day-trade orders
+- reasons for entry, waiting, blocking, or exit
+
+Use the dashboard date filter to review exactly what happened on a specific trading day across Day Trading, Trade Decisions, Orders, Catalyst, Market, Research, and Audit History.
 
 ## Crypto Research
 
@@ -154,7 +221,7 @@ Start the local dashboard:
 trading-agent dashboard
 ```
 
-The dashboard includes trade decisions, orders, market snapshots, research, audit history, and a performance report with equity drawdown, win rate, open P/L, exit-signal P/L, and strategy-level assessment.
+The dashboard includes trade decisions, day trading, orders, market snapshots, research, audit history, and a performance report with equity drawdown, win rate, open P/L, exit-signal P/L, and strategy-level assessment.
 
 ## Continuous Run On macOS
 
