@@ -118,3 +118,24 @@ def test_covered_call_allowed_when_coverage_remains_after_short_calls() -> None:
     )
 
     assert reason is None
+
+
+def test_existing_option_exposure_blocks_same_underlying_option_entries() -> None:
+    agent = TradingAgent.__new__(TradingAgent)
+    positions = [
+        Position(
+            symbol="CDNS260618C00400000",
+            asset_class=AssetClass.OPTION,
+            qty=1,
+            market_value=1_960,
+        ),
+        Position(
+            symbol="CDNS260618C00420000",
+            asset_class=AssetClass.OPTION,
+            qty=-1,
+            market_value=-820,
+        ),
+    ]
+
+    assert agent._has_open_option_exposure("CDNS", positions) is True
+    assert agent._has_open_option_exposure("AAPL", positions) is False

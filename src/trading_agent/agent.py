@@ -1209,6 +1209,11 @@ class TradingAgent:
         positions: list[Position],
         existing_candidates: Iterable[TradeCandidate],
     ) -> list[TradeCandidate]:
+        if self._has_open_option_exposure(market.symbol, positions):
+            self.console.print(
+                f"[yellow]options skipped for {market.symbol}[/yellow] existing option exposure is already open"
+            )
+            return []
         try:
             contracts = await self.broker.get_option_contracts(market.symbol)
         except Exception as exc:
@@ -1226,6 +1231,15 @@ class TradingAgent:
             *self.options.debit_spread_candidates(market, contracts, bullish_score),
         ]
         return await self._hydrate_option_prices(candidates)
+
+    def _has_open_option_exposure(self, underlying: str, positions: list[Position]) -> bool:
+        for position in positions:
+            if position.asset_class != AssetClass.OPTION or position.qty == 0:
+                continue
+            parsed = self._parse_option_symbol(position.symbol)
+            if parsed and parsed["underlying"] == underlying:
+                return True
+        return False
 
     async def _hydrate_option_prices(self, candidates: list[TradeCandidate]) -> list[TradeCandidate]:
         priced: list[TradeCandidate] = []
