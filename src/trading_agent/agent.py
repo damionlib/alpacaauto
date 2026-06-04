@@ -176,6 +176,13 @@ class TradingAgent:
                     positions,
                     trades_used_today=self._day_trade_entries_today(),
                 )
+                if day_trade_candidate and self._has_non_day_trade_entry(raw_symbol_candidates, market.symbol):
+                    day_trade_candidate = None
+                    day_trade_signal = {
+                        **day_trade_signal,
+                        "status": "blocked",
+                        "reason": "Swing candidate exists for this symbol in the same cycle; preferring swing trade.",
+                    }
                 if self.settings.day_trading.enabled:
                     self._audit_event(
                         cycle_id,
@@ -192,6 +199,10 @@ class TradingAgent:
                 raw_symbol_candidates,
                 prediction,
             )
+            symbol_candidates, same_day_day_trade_blocks = self._block_swing_after_day_trade_entry(
+                symbol_candidates
+            )
+            blocked_candidates.extend(same_day_day_trade_blocks)
             for candidate in symbol_candidates:
                 self._audit_candidate(cycle_id, candidate)
             for candidate, reason in blocked_candidates:
@@ -212,6 +223,36 @@ class TradingAgent:
                     self._audit_candidate(cycle_id, candidate, status="blocked", reason=reason)
                 candidates.extend(option_candidates)
         return sorted(candidates, key=lambda candidate: candidate.score, reverse=True)
+
+    def _has_non_day_trade_entry(self, candidates: list[TradeCandidate], symbol: str) -> bool:
+        return any(
+            candidate.symbol == symbol
+            and not candidate.metadata.get("exit")
+            and not candidate.metadata.get("day_trade_entry")
+            for candidate in candidates
+        )
+
+    def _block_swing_after_day_trade_entry(
+        self,
+        candidates: list[TradeCandidate],
+    ) -> tuple[list[TradeCandidate], list[tuple[TradeCandidate, str]]]:
+        accepted: list[TradeCandidate] = []
+        blocked: list[tuple[TradeCandidate, str]] = []
+        for candidate in candidates:
+            if (
+                candidate.metadata.get("exit")
+                or candidate.metadata.get("day_trade_entry")
+                or not self._day_trade_entry_event_today(candidate.symbol)
+            ):
+                accepted.append(candidate)
+                continue
+            blocked.append(
+                (
+                    candidate,
+                    "Day-trade entry already exists for this symbol today; blocking swing entry to avoid broker-level position averaging.",
+                )
+            )
+        return accepted, blocked
 
     async def _day_trade_exit_candidates(
         self,
@@ -1024,12 +1065,12 @@ class TradingAgent:
         return self.audit.order_counts_since(start_of_trading_day())
 
     def _day_trade_entries_today(self) -> int:
-        if not self.audit:
+        if not getattr(self, "audit", None):
             return 0
         return len(self.audit.day_trade_entries_since(start_of_trading_day()))
 
     def _day_trade_entry_event_today(self, symbol: str) -> dict | None:
-        if not self.audit:
+        if not getattr(self, "audit", None):
             return None
         return self.audit.latest_day_trade_entry_for_symbol(symbol, start_of_trading_day())
 
