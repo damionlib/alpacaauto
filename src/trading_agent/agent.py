@@ -544,8 +544,8 @@ class TradingAgent:
             return []
         canceled: list[dict] = []
         for order in open_orders["orders"]:
-            order_symbol = str(order.get("symbol") or "")
-            if order_symbol not in symbols:
+            order_symbols = self._order_symbols(order)
+            if not order_symbols.intersection(symbols):
                 continue
             order_id = str(order.get("id") or "")
             if not order_id:
@@ -556,6 +556,7 @@ class TradingAgent:
                 self.console.print(f"[yellow]could not cancel resting order[/yellow] {order_id}: {exc}")
                 continue
             canceled.append(order)
+            order_symbol = str(order.get("symbol") or "") or ",".join(sorted(order_symbols))
             self._audit_event(
                 cycle_id,
                 "order",
@@ -853,16 +854,33 @@ class TradingAgent:
         client_order_id = str(order.get("client_order_id") or "")
         if "protect" in client_order_id:
             return False
-        position_intent = str(order.get("position_intent") or "")
-        if position_intent.endswith("_to_open"):
+        position_intents = self._order_position_intents(order)
+        if any(intent.endswith("_to_open") for intent in position_intents):
             return True
-        if position_intent.endswith("_to_close"):
+        if any(intent.endswith("_to_close") for intent in position_intents):
             return False
         order_type = str(order.get("type") or order.get("order_type") or "")
         side = str(order.get("side") or "")
         if client_order_id.startswith("ta-") and side == "buy" and order_type not in {"stop", "stop_limit"}:
             return True
         return False
+
+    def _order_position_intents(self, order: dict) -> list[str]:
+        intents = [str(order.get("position_intent") or "")]
+        for leg in order.get("legs") or []:
+            intents.append(str(leg.get("position_intent") or ""))
+        return [intent for intent in intents if intent]
+
+    def _order_symbols(self, order: dict) -> set[str]:
+        symbols = set()
+        symbol = str(order.get("symbol") or "")
+        if symbol:
+            symbols.add(symbol)
+        for leg in order.get("legs") or []:
+            leg_symbol = str(leg.get("symbol") or "")
+            if leg_symbol:
+                symbols.add(leg_symbol)
+        return symbols
 
     def _strategy_from_order(self, order: dict) -> str | None:
         client_order_id = str(order.get("client_order_id") or "")
@@ -1122,16 +1140,26 @@ class TradingAgent:
         symbols = set()
         covered_call_contracts_by_underlying: dict[str, int] = {}
         for order in open_orders:
-            symbol = str(order.get("symbol") or "")
             side = str(order.get("side") or "")
             qty = int(float(order.get("qty") or 0))
-            symbols.add(symbol)
-            parsed = self._parse_option_symbol(symbol)
-            if side == "sell" and parsed and parsed["type"] == "C":
+            symbols.update(self._order_symbols(order))
+            parsed = self._parse_option_symbol(str(order.get("symbol") or ""))
+            is_covered_call_order = self._strategy_from_order(order) == "covered_call"
+            if is_covered_call_order and side == "sell" and parsed and parsed["type"] == "C":
                 underlying = parsed["underlying"]
                 covered_call_contracts_by_underlying[underlying] = (
                     covered_call_contracts_by_underlying.get(underlying, 0) + qty
                 )
+            for leg in order.get("legs") or []:
+                leg_symbol = str(leg.get("symbol") or "")
+                leg_side = str(leg.get("side") or "")
+                leg_qty = int(float(leg.get("qty") or leg.get("ratio_qty") or qty or 0))
+                parsed = self._parse_option_symbol(leg_symbol)
+                if is_covered_call_order and leg_side == "sell" and parsed and parsed["type"] == "C":
+                    underlying = parsed["underlying"]
+                    covered_call_contracts_by_underlying[underlying] = (
+                        covered_call_contracts_by_underlying.get(underlying, 0) + leg_qty
+                    )
         return {
             "symbols": symbols,
             "covered_call_contracts_by_underlying": covered_call_contracts_by_underlying,

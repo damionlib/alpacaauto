@@ -467,6 +467,50 @@ def _crypto_exit_decision(symbol: str = "BTC/USD", qty: float = 2.0) -> RiskDeci
     return RiskDecision(approved=True, reason="exit", intent=intent, candidate=candidate)
 
 
+def _spread_exit_decision() -> RiskDecision:
+    legs = [
+        {
+            "symbol": "CDNS260618C00410000",
+            "ratio_qty": "1",
+            "side": "sell",
+            "position_intent": "sell_to_close",
+        },
+        {
+            "symbol": "CDNS260618C00430000",
+            "ratio_qty": "1",
+            "side": "buy",
+            "position_intent": "buy_to_close",
+        },
+    ]
+    candidate = TradeCandidate(
+        symbol="CDNS_call_debit_spread",
+        asset_class=AssetClass.OPTION,
+        side=OrderSide.SELL,
+        strategy="spread_stop_loss_exit",
+        score=100,
+        entry_price=6.4,
+        metadata={
+            "exit": True,
+            "spread_exit": True,
+            "exit_qty": 1,
+            "legs": legs,
+            "paired_symbols": ["CDNS260618C00410000", "CDNS260618C00430000"],
+        },
+    )
+    intent = OrderIntent(
+        symbol="CDNS_call_debit_spread",
+        asset_class=AssetClass.OPTION,
+        side=OrderSide.SELL,
+        qty=1,
+        order_type=OrderType.LIMIT,
+        limit_price=6.4,
+        order_class="mleg",
+        legs=legs,
+        metadata=candidate.metadata,
+    )
+    return RiskDecision(approved=True, reason="exit", intent=intent, candidate=candidate)
+
+
 _CONFLICT = RuntimeError("POST /v2/orders failed with 403: 40310000: insufficient qty available")
 _TRANSIENT = RuntimeError("POST /v2/orders failed with 503: service temporarily unavailable")
 
@@ -487,6 +531,48 @@ async def test_exit_conflict_error_cancels_then_retries_successfully() -> None:
     assert broker.calls == ["submit-fail:AAPL", "cancel:x1", "submit:AAPL"]
     assert len(broker.submitted) == 1
     assert broker.cancel_all_called is False
+
+
+@pytest.mark.anyio
+async def test_spread_exit_conflict_cancels_parent_mleg_order_then_retries() -> None:
+    stale_opening_spread = {
+        "id": "mleg-1",
+        "symbol": "",
+        "client_order_id": "ta-call_debit_spread-stale",
+        "order_class": "mleg",
+        "qty": "1",
+        "legs": [
+            {
+                "symbol": "CDNS260618C00410000",
+                "side": "buy",
+                "ratio_qty": "1",
+                "position_intent": "buy_to_open",
+            },
+            {
+                "symbol": "CDNS260618C00430000",
+                "side": "sell",
+                "ratio_qty": "1",
+                "position_intent": "sell_to_open",
+            },
+        ],
+    }
+    broker = ScriptedBroker(
+        open_orders=[stale_opening_spread],
+        submit_outcomes=[RuntimeError("POST /v2/orders failed with 403: potential wash trade detected")],
+    )
+    agent = _agent(broker)
+    account = AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000, last_equity=100_000)
+
+    await agent._submit_decisions([_spread_exit_decision()], account, None)
+
+    assert broker.canceled == ["mleg-1"]
+    assert broker.calls == [
+        "submit-fail:CDNS_call_debit_spread",
+        "cancel:mleg-1",
+        "submit:CDNS_call_debit_spread",
+    ]
+    assert len(broker.submitted) == 1
+    assert broker.submitted[0].order_class == "mleg"
 
 
 @pytest.mark.anyio
