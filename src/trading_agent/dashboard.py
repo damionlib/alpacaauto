@@ -38,6 +38,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             event_type = params.get("event_type", [None])[0] or None
             symbol = params.get("symbol", [None])[0] or None
             status = params.get("status", [None])[0] or None
+            trading_date = params.get("trading_date", [None])[0] or None
             self._send_json(
                 {
                     "events": self.server.store.events(
@@ -45,6 +46,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         event_type=event_type,
                         symbol=symbol,
                         status=status,
+                        trading_date=trading_date,
                         limit=limit,
                     )
                 }
@@ -291,6 +293,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <nav class="tabs">
       <button class="tab active" data-tab="decisions">Trade Decisions</button>
       <button class="tab" data-tab="orders">Orders</button>
+      <button class="tab" data-tab="dayTrading">Day Trading</button>
       <button class="tab" data-tab="catalyst">Catalyst</button>
       <button class="tab" data-tab="performance">Performance</button>
       <button class="tab" data-tab="market">Market</button>
@@ -300,6 +303,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div class="toolbar filterbar" id="symbolFilterBar">
       <div>
         <input id="symbolFilter" type="text" placeholder="Filter symbol, e.g. HON or AAPL260617C00305000" autocomplete="off">
+        <input id="dateFilter" type="date" aria-label="Filter trading date">
         <button id="applySymbolFilter">Apply</button>
         <button id="clearSymbolFilter">Clear</button>
       </div>
@@ -307,6 +311,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     </div>
     <section id="decisions" class="panel"></section>
     <section id="orders" class="panel hidden"></section>
+    <section id="dayTrading" class="panel hidden"></section>
     <section id="catalyst" class="panel hidden"></section>
     <section id="performance" class="panel hidden"></section>
     <section id="market" class="panel hidden"></section>
@@ -319,6 +324,7 @@ DASHBOARD_HTML = r"""<!doctype html>
             <option value="market_snapshot">Market snapshots</option>
             <option value="research_result">Research results</option>
             <option value="catalyst_prediction">Catalyst predictions</option>
+            <option value="day_trade_signal">Day-trade signals</option>
             <option value="trade_candidate">Trade candidates</option>
             <option value="risk_decision">Risk decisions</option>
             <option value="order">Orders</option>
@@ -349,7 +355,15 @@ DASHBOARD_HTML = r"""<!doctype html>
     </section>
   </main>
   <script>
-    const state = { summary: null, performance: null, auditEvents: [], symbolFilter: "", symbolData: null };
+    const state = {
+      summary: null,
+      performance: null,
+      auditEvents: [],
+      symbolFilter: "",
+      dateFilter: "",
+      symbolData: null,
+      dateData: null,
+    };
     const currency = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 
     function fmtMoney(value) {
@@ -381,16 +395,18 @@ DASHBOARD_HTML = r"""<!doctype html>
       return event.payload || {};
     }
     function displaySummary() {
+      if (state.dateFilter && state.dateData) return state.dateData;
       if (!state.symbolFilter || !state.symbolData) return state.summary || {};
       return { ...(state.summary || {}), ...state.symbolData };
     }
     function updateSymbolFilterMeta() {
       const meta = document.getElementById("symbolFilterMeta");
       if (!state.symbolFilter) {
-        meta.textContent = "Showing latest cycle";
+        meta.textContent = state.dateFilter ? `Showing events from ${state.dateFilter}` : "Showing latest cycle";
         return;
       }
-      meta.textContent = `Filtering exact event symbol ${state.symbolFilter} across audit history`;
+      const dateText = state.dateFilter ? ` on ${state.dateFilter}` : "";
+      meta.textContent = `Filtering exact event symbol ${state.symbolFilter}${dateText}`;
     }
     function syncFilterbarVisibility(activeTab) {
       const filterbar = document.getElementById("symbolFilterBar");
@@ -398,9 +414,41 @@ DASHBOARD_HTML = r"""<!doctype html>
     }
     async function fetchEventList(params) {
       const query = new URLSearchParams({ limit: "500", ...params });
+      if (state.dateFilter) query.set("trading_date", state.dateFilter);
       const response = await fetch(`/api/events?${query.toString()}`, { cache: "no-store" });
       const data = await response.json();
       return data.events || [];
+    }
+    async function loadDateData() {
+      if (!state.dateFilter) {
+        state.dateData = null;
+        return;
+      }
+      const symbolParams = state.symbolFilter ? { symbol: state.symbolFilter } : {};
+      const [
+        decisions,
+        orders,
+        marketSnapshots,
+        researchResults,
+        catalystPredictions,
+        dayTradeSignals,
+      ] = await Promise.all([
+        fetchEventList({ ...symbolParams, event_type: "risk_decision" }),
+        fetchEventList({ ...symbolParams, event_type: "order" }),
+        fetchEventList({ ...symbolParams, event_type: "market_snapshot" }),
+        fetchEventList({ ...symbolParams, event_type: "research_result" }),
+        fetchEventList({ ...symbolParams, event_type: "catalyst_prediction" }),
+        fetchEventList({ ...symbolParams, event_type: "day_trade_signal" }),
+      ]);
+      state.dateData = {
+        cycle: state.summary?.cycle || null,
+        decisions,
+        orders,
+        market_snapshots: marketSnapshots,
+        research_results: researchResults,
+        catalyst_predictions: catalystPredictions,
+        day_trade_signals: dayTradeSignals,
+      };
     }
     async function loadSymbolData() {
       if (!state.symbolFilter) {
@@ -435,6 +483,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       const summary = displaySummary();
       renderDecisions(summary);
       renderOrders(summary);
+      renderDayTrading(summary);
       renderCatalyst(summary);
       renderMarket(summary);
       renderResearch(summary);
@@ -525,6 +574,90 @@ DASHBOARD_HTML = r"""<!doctype html>
         { key: "reason", label: "Reason" },
         { key: "time", label: "Time" },
       ], rows, "No submitted or rejected orders recorded yet.");
+    }
+    function renderDayTrading(summary) {
+      const signals = summary.day_trade_signals || [];
+      const decisions = (summary.decisions || []).filter(event => String(event.strategy || "").startsWith("day_trade"));
+      const orders = (summary.orders || []).filter(event => String(event.strategy || "").startsWith("day_trade"));
+      const signalRows = signals.slice().reverse().map(event => {
+        const data = payload(event);
+        return {
+          time: esc(fmtDate(event.created_at)),
+          status: statusPill(event.status),
+          symbol: esc(event.symbol),
+          kind: esc(data.kind || ""),
+          setup: esc(data.setup || ""),
+          combined: esc(Number(data.combined_score || 0).toFixed(2)),
+          catalyst: esc(Number(data.catalyst_score || 0).toFixed(2)),
+          intraday: esc(Number(data.intraday_score || 0).toFixed(2)),
+          execution: esc(Number(data.execution_score || 0).toFixed(2)),
+          reason: `<div class="detail">${esc(event.reason || data.reason || "")}</div>`,
+        };
+      });
+      const decisionRows = decisions.slice().reverse().map(event => {
+        const candidate = payload(event).candidate || {};
+        const signal = candidate.metadata?.signal || {};
+        return {
+          time: esc(fmtDate(event.created_at)),
+          approved: statusPill(event.approved ? "approved" : "rejected"),
+          symbol: esc(event.symbol),
+          strategy: esc(event.strategy),
+          score: esc(Number(event.score || 0).toFixed(2)),
+          setup: esc(signal.setup || candidate.metadata?.setup || ""),
+          reason: `<div class="detail">${esc(event.reason || "")}</div>`,
+        };
+      });
+      const orderRows = orders.map(event => {
+        const data = payload(event);
+        const intent = data.intent || {};
+        return {
+          time: esc(fmtDate(event.created_at)),
+          status: statusPill(event.status),
+          symbol: esc(event.symbol),
+          strategy: esc(event.strategy),
+          side: esc(intent.side || ""),
+          qty: esc(intent.qty ?? ""),
+          reason: `<div class="detail">${esc(event.reason || data.error || "")}</div>`,
+        };
+      });
+      document.getElementById("dayTrading").innerHTML = `
+        <div class="toolbar"><div class="meta">Day-trade signals</div><div class="meta">Signals explain why the agent waited, entered, or exited.</div></div>
+        <div id="dayTradeSignals"></div>
+        <div class="toolbar"><div class="meta">Day-trade decisions</div></div>
+        <div id="dayTradeDecisions"></div>
+        <div class="toolbar"><div class="meta">Day-trade orders</div></div>
+        <div id="dayTradeOrders"></div>
+      `;
+      renderTable("dayTradeSignals", [
+        { key: "time", label: "Time" },
+        { key: "status", label: "Status" },
+        { key: "symbol", label: "Symbol" },
+        { key: "kind", label: "Kind" },
+        { key: "setup", label: "Setup" },
+        { key: "combined", label: "Combined", cls: "num" },
+        { key: "catalyst", label: "Catalyst", cls: "num" },
+        { key: "intraday", label: "Intraday", cls: "num" },
+        { key: "execution", label: "Execution", cls: "num" },
+        { key: "reason", label: "Reason" },
+      ], signalRows, "No day-trade signals recorded for this view.");
+      renderTable("dayTradeDecisions", [
+        { key: "time", label: "Time" },
+        { key: "approved", label: "Approved" },
+        { key: "symbol", label: "Symbol" },
+        { key: "strategy", label: "Strategy" },
+        { key: "score", label: "Score", cls: "num" },
+        { key: "setup", label: "Setup" },
+        { key: "reason", label: "Reason" },
+      ], decisionRows, "No day-trade decisions recorded for this view.");
+      renderTable("dayTradeOrders", [
+        { key: "time", label: "Time" },
+        { key: "status", label: "Status" },
+        { key: "symbol", label: "Symbol" },
+        { key: "strategy", label: "Strategy" },
+        { key: "side", label: "Side" },
+        { key: "qty", label: "Qty", cls: "num" },
+        { key: "reason", label: "Reason" },
+      ], orderRows, "No day-trade orders recorded for this view.");
     }
     function renderCatalyst(summary) {
       const rows = (summary.catalyst_predictions || []).slice().reverse().map(event => {
@@ -687,7 +820,12 @@ DASHBOARD_HTML = r"""<!doctype html>
       const response = await fetch("/api/summary", { cache: "no-store" });
       state.summary = await response.json();
       renderMetrics(state.summary);
-      await loadSymbolData();
+      if (state.dateFilter) {
+        await loadDateData();
+        updateSymbolFilterMeta();
+      } else {
+        await loadSymbolData();
+      }
       renderMainTables();
       document.getElementById("refreshMeta").textContent = `Updated ${new Date().toLocaleTimeString()} • Auto-refreshing every 10s`;
     }
@@ -698,6 +836,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       if (eventType) query.set("event_type", eventType);
       if (eventStatus) query.set("status", eventStatus);
       if (state.symbolFilter) query.set("symbol", state.symbolFilter);
+      if (state.dateFilter) query.set("trading_date", state.dateFilter);
       const response = await fetch(`/api/events?${query.toString()}`, { cache: "no-store" });
       const data = await response.json();
       state.auditEvents = data.events || [];
@@ -743,15 +882,24 @@ DASHBOARD_HTML = r"""<!doctype html>
     document.getElementById("eventStatus").addEventListener("change", loadAudit);
     document.getElementById("applySymbolFilter").addEventListener("click", () => {
       state.symbolFilter = document.getElementById("symbolFilter").value.trim().toUpperCase();
+      state.dateFilter = document.getElementById("dateFilter").value;
       loadSummary();
       if (!document.getElementById("audit").classList.contains("hidden")) loadAudit();
     });
     document.getElementById("clearSymbolFilter").addEventListener("click", () => {
       document.getElementById("symbolFilter").value = "";
+      document.getElementById("dateFilter").value = "";
       state.symbolFilter = "";
+      state.dateFilter = "";
       state.symbolData = null;
+      state.dateData = null;
       updateSymbolFilterMeta();
       renderMainTables();
+      if (!document.getElementById("audit").classList.contains("hidden")) loadAudit();
+    });
+    document.getElementById("dateFilter").addEventListener("change", () => {
+      state.dateFilter = document.getElementById("dateFilter").value;
+      loadSummary();
       if (!document.getElementById("audit").classList.contains("hidden")) loadAudit();
     });
     document.getElementById("symbolFilter").addEventListener("keydown", event => {

@@ -97,6 +97,26 @@ class CatalystConfig(BaseModel):
     require_medium_confidence_for_options: bool = True
 
 
+class DayTradingConfig(BaseModel):
+    enabled: bool = False
+    paper_only: bool = True
+    max_trades_per_day: int = Field(default=3, ge=0)
+    risk_per_trade_pct: float = Field(default=0.25, gt=0, le=5)
+    max_position_pct: float = Field(default=4.0, gt=0, le=25)
+    max_daily_loss_pct: float = Field(default=1.0, gt=0, le=10)
+    max_position_minutes: int = Field(default=120, ge=1)
+    force_exit_before_close_minutes: int = Field(default=15, ge=0)
+    min_catalyst_score: float = Field(default=65.0, ge=0, le=100)
+    min_intraday_score: float = Field(default=70.0, ge=0, le=100)
+    min_combined_score: float = Field(default=80.0, ge=0, le=100)
+    exit_intraday_score: float = Field(default=45.0, ge=0, le=100)
+    stop_loss_pct: float = Field(default=1.0, gt=0, le=10)
+    take_profit_pct: float = Field(default=2.0, gt=0, le=20)
+    trailing_stop_pct: float = Field(default=1.0, gt=0, le=10)
+    min_relative_volume: float = Field(default=1.2, ge=0)
+    max_spread_pct: float = Field(default=0.25, gt=0, le=5)
+
+
 class ResearchConfig(BaseModel):
     news_headline_limit: int = Field(default=8, ge=0, le=50)
     news_cache_enabled: bool = True
@@ -121,6 +141,7 @@ class Settings(BaseModel):
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     screener: ScreenerConfig = Field(default_factory=ScreenerConfig)
     catalyst: CatalystConfig = Field(default_factory=CatalystConfig)
+    day_trading: DayTradingConfig = Field(default_factory=DayTradingConfig)
     research: ResearchConfig = Field(default_factory=ResearchConfig)
     alpaca_api_key_id: SecretStr | None = None
     alpaca_api_secret_key: SecretStr | None = None

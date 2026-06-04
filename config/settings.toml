@@ -75,6 +75,25 @@ block_rumor_only = true
 block_high_event_risk = true
 require_medium_confidence_for_options = true
 
+[day_trading]
+enabled = false
+paper_only = true
+max_trades_per_day = 3
+risk_per_trade_pct = 0.25
+max_position_pct = 4.0
+max_daily_loss_pct = 1.0
+max_position_minutes = 120
+force_exit_before_close_minutes = 15
+min_catalyst_score = 65.0
+min_intraday_score = 70.0
+min_combined_score = 80.0
+exit_intraday_score = 45.0
+stop_loss_pct = 1.0
+take_profit_pct = 2.0
+trailing_stop_pct = 1.0
+min_relative_volume = 1.2
+max_spread_pct = 0.25
+
 [research]
 news_headline_limit = 8
 news_cache_enabled = true

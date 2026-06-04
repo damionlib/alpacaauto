@@ -14,6 +14,7 @@ from trading_agent.broker_sync import BrokerOrderSync
 from trading_agent.brokers.alpaca import AlpacaBroker
 from trading_agent.catalyst.service import CatalystEngine
 from trading_agent.config import Settings
+from trading_agent.day_trading import DayTradingEngine
 from trading_agent.models import (
     AssetClass,
     OrderIntent,
@@ -59,6 +60,7 @@ class TradingAgent:
         self.momentum = MomentumStrategy(settings)
         self.options = OptionsStrategy(settings)
         self.catalyst = CatalystEngine(settings)
+        self.day_trading = DayTradingEngine(settings)
         self.audit = AuditStore(settings.audit.database_path) if settings.audit.enabled else None
         self.broker_sync = BrokerOrderSync(self.broker, self.audit, self.console) if self.audit else None
         self.position_manager = PositionManager(settings, self.audit)
@@ -92,7 +94,10 @@ class TradingAgent:
         try:
             if self.audit:
                 self.audit.reconcile_position_states({position.symbol for position in positions})
-            exit_candidates = self.position_manager.evaluate(positions)
+            exit_candidates = [
+                *self.position_manager.evaluate(positions),
+                *await self._day_trade_exit_candidates(positions, cycle_id),
+            ]
             for candidate in exit_candidates:
                 self._audit_candidate(cycle_id, candidate)
             entry_candidates = (
@@ -162,6 +167,27 @@ class TradingAgent:
             catalyst_entry = self.catalyst.entry_candidate(market, prediction, raw_symbol_candidates)
             if catalyst_entry:
                 raw_symbol_candidates.append(catalyst_entry)
+            day_trading = getattr(self, "day_trading", None)
+            if day_trading:
+                day_trade_candidate, day_trade_signal = day_trading.evaluate_entry(
+                    market,
+                    research,
+                    prediction,
+                    positions,
+                    trades_used_today=self._day_trade_entries_today(),
+                )
+                if self.settings.day_trading.enabled:
+                    self._audit_event(
+                        cycle_id,
+                        "day_trade_signal",
+                        day_trade_signal,
+                        symbol=market.symbol,
+                        score=day_trade_signal.get("combined_score"),
+                        status=day_trade_signal.get("status"),
+                        reason=day_trade_signal.get("reason"),
+                    )
+                if day_trade_candidate:
+                    raw_symbol_candidates.append(day_trade_candidate)
             symbol_candidates, blocked_candidates = self.catalyst.apply_to_candidates(
                 raw_symbol_candidates,
                 prediction,
@@ -185,6 +211,70 @@ class TradingAgent:
                 for candidate, reason in blocked_options:
                     self._audit_candidate(cycle_id, candidate, status="blocked", reason=reason)
                 candidates.extend(option_candidates)
+        return sorted(candidates, key=lambda candidate: candidate.score, reverse=True)
+
+    async def _day_trade_exit_candidates(
+        self,
+        positions: list[Position],
+        cycle_id: int | None,
+    ) -> list[TradeCandidate]:
+        if not self.settings.day_trading.enabled:
+            return []
+        day_trading = getattr(self, "day_trading", None)
+        if not day_trading:
+            return []
+        candidates: list[TradeCandidate] = []
+        for position in positions:
+            if position.asset_class not in {AssetClass.EQUITY, AssetClass.ETF} or position.qty <= 0:
+                continue
+            entry_event = self._day_trade_entry_event_today(position.symbol)
+            if not entry_event:
+                continue
+            market = await self.broker.get_market_snapshot(position.symbol)
+            self._audit_event(
+                cycle_id,
+                "market_snapshot",
+                market,
+                symbol=market.symbol,
+                status="captured",
+            )
+            research = await self.research.research_symbol(position.symbol)
+            self._audit_event(
+                cycle_id,
+                "research_result",
+                research,
+                symbol=research.symbol,
+                status="captured",
+            )
+            prediction = self.catalyst.evaluate(market, research)
+            if self.settings.catalyst.enabled:
+                self._audit_event(
+                    cycle_id,
+                    "catalyst_prediction",
+                    prediction,
+                    symbol=market.symbol,
+                    score=prediction.prediction_score,
+                    status=prediction.direction,
+                    reason=prediction.block_reason,
+                )
+            candidate, signal = day_trading.evaluate_exit(
+                position,
+                market,
+                research,
+                prediction,
+                entry_event=entry_event,
+            )
+            self._audit_event(
+                cycle_id,
+                "day_trade_signal",
+                signal,
+                symbol=position.symbol,
+                score=signal.get("combined_score"),
+                status=signal.get("status"),
+                reason=signal.get("reason"),
+            )
+            if candidate:
+                candidates.append(candidate)
         return sorted(candidates, key=lambda candidate: candidate.score, reverse=True)
 
     async def _screened_symbols(
@@ -251,6 +341,7 @@ class TradingAgent:
 
         submitted_entries = 0
         submitted_total = 0
+        submitted_day_entries = 0
         for decision in [*exit_decisions, *entry_decisions]:
             is_exit = bool(decision.candidate.metadata.get("exit"))
             if not is_exit and submitted_entries >= self.settings.agent.max_orders_per_cycle:
@@ -275,6 +366,19 @@ class TradingAgent:
                     strategy=decision.candidate.strategy,
                     status="skipped",
                     reason=cap_reason,
+                )
+                continue
+            day_cap_reason = self._day_trade_cap_reason(decision, submitted_day_entries)
+            if day_cap_reason:
+                self.console.print(f"[yellow]order skipped[/yellow] {decision.intent.symbol}: {day_cap_reason}")
+                self._audit_event(
+                    cycle_id,
+                    "order",
+                    {"intent": decision.intent},
+                    symbol=decision.intent.symbol,
+                    strategy=decision.candidate.strategy,
+                    status="skipped",
+                    reason=day_cap_reason,
                 )
                 continue
             if not is_exit:
@@ -342,6 +446,8 @@ class TradingAgent:
             remaining_cash = max(remaining_cash - cash_required, 0.0)
             if not is_exit:
                 submitted_entries += 1
+                if decision.candidate.metadata.get("day_trade_entry"):
+                    submitted_day_entries += 1
             submitted_total += 1
             self._audit_event(
                 cycle_id,
@@ -917,6 +1023,16 @@ class TradingAgent:
             return {"total_orders": 0, "entry_orders": 0, "exit_orders": 0}
         return self.audit.order_counts_since(start_of_trading_day())
 
+    def _day_trade_entries_today(self) -> int:
+        if not self.audit:
+            return 0
+        return len(self.audit.day_trade_entries_since(start_of_trading_day()))
+
+    def _day_trade_entry_event_today(self, symbol: str) -> dict | None:
+        if not self.audit:
+            return None
+        return self.audit.latest_day_trade_entry_for_symbol(symbol, start_of_trading_day())
+
     def _daily_cap_reason(
         self,
         decision: RiskDecision,
@@ -942,6 +1058,17 @@ class TradingAgent:
                 f"Daily entry order cap reached "
                 f"({daily_counts['entry_orders']}/{max_entry_orders} already submitted today)."
             )
+        return None
+
+    def _day_trade_cap_reason(self, decision: RiskDecision, submitted_day_entries: int) -> str | None:
+        if not decision.candidate.metadata.get("day_trade_entry"):
+            return None
+        max_trades = self.settings.day_trading.max_trades_per_day
+        if not max_trades:
+            return None
+        used = self._day_trade_entries_today()
+        if used + submitted_day_entries + 1 > max_trades:
+            return f"Daily day-trade entry cap reached ({used}/{max_trades} already submitted today)."
         return None
 
     async def _open_order_reservations(self) -> dict:

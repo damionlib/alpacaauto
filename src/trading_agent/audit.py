@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -167,6 +167,7 @@ class AuditStore:
         event_type: str | None = None,
         symbol: str | None = None,
         status: str | None = None,
+        trading_date: str | None = None,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
         query = "select * from audit_events"
@@ -184,6 +185,10 @@ class AuditStore:
         if status:
             clauses.append("upper(status) = upper(?)")
             params.append(status)
+        if trading_date:
+            start, end = self._trading_date_bounds(trading_date)
+            clauses.append("created_at >= ? and created_at < ?")
+            params.extend([start.isoformat(), end.isoformat()])
         if clauses:
             query += " where " + " and ".join(clauses)
         query += " order by id desc limit ?"
@@ -202,6 +207,7 @@ class AuditStore:
                 "market_snapshots": [],
                 "research_results": [],
                 "catalyst_predictions": [],
+                "day_trade_signals": [],
             }
         cycle_id = int(cycle["id"])
         return {
@@ -211,6 +217,7 @@ class AuditStore:
             "market_snapshots": self.events(cycle_id=cycle_id, event_type="market_snapshot", limit=500),
             "research_results": self.events(cycle_id=cycle_id, event_type="research_result", limit=500),
             "catalyst_predictions": self.events(cycle_id=cycle_id, event_type="catalyst_prediction", limit=500),
+            "day_trade_signals": self.events(cycle_id=cycle_id, event_type="day_trade_signal", limit=500),
         }
 
     def performance_report(self) -> dict[str, Any]:
@@ -281,6 +288,42 @@ class AuditStore:
             "entry_orders": entry_orders,
             "exit_orders": exit_orders,
         }
+
+    def day_trade_entries_since(self, since: datetime) -> list[dict[str, Any]]:
+        since_text = since.astimezone(UTC).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                select *
+                from audit_events
+                where event_type = 'order'
+                  and status = 'submitted'
+                  and strategy = 'day_trade_entry'
+                  and created_at >= ?
+                order by id desc
+                """,
+                (since_text,),
+            ).fetchall()
+        return [self._event_row(row) for row in rows]
+
+    def latest_day_trade_entry_for_symbol(self, symbol: str, since: datetime) -> dict[str, Any] | None:
+        since_text = since.astimezone(UTC).isoformat()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                select *
+                from audit_events
+                where event_type = 'order'
+                  and status = 'submitted'
+                  and strategy = 'day_trade_entry'
+                  and upper(symbol) = upper(?)
+                  and created_at >= ?
+                order by id desc
+                limit 1
+                """,
+                (symbol, since_text),
+            ).fetchone()
+        return self._event_row(row) if row else None
 
     def broker_order_update_exists(self, broker_order_id: str) -> bool:
         pattern = f'%"id": "{broker_order_id}"%'
@@ -447,6 +490,16 @@ class AuditStore:
             "reason": row["reason"],
             "payload": self._loads(row["payload_json"]),
         }
+
+    def _trading_date_bounds(self, trading_date: str) -> tuple[datetime, datetime]:
+        try:
+            parsed = date.fromisoformat(trading_date)
+        except ValueError:
+            parsed = datetime.now(UTC).date()
+        timezone = ZoneInfo("America/Chicago")
+        local_start = datetime.combine(parsed, time.min, tzinfo=timezone)
+        local_end = local_start + timedelta(days=1)
+        return local_start.astimezone(UTC), local_end.astimezone(UTC)
 
 
 def start_of_trading_day(

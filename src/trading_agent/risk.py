@@ -29,7 +29,12 @@ class RiskEngine:
         if candidate.metadata.get("exit"):
             return self._evaluate_exit(candidate, positions)
 
-        if account.daily_pl_pct <= -self.settings.risk.max_daily_loss_pct:
+        max_daily_loss_pct = (
+            self.settings.day_trading.max_daily_loss_pct
+            if candidate.metadata.get("day_trade")
+            else self.settings.risk.max_daily_loss_pct
+        )
+        if account.daily_pl_pct <= -max_daily_loss_pct:
             return self._reject(candidate, f"Daily loss stop reached: {account.daily_pl_pct:.2f}%.")
 
         cash_buffer = account.equity * (self.settings.risk.min_cash_buffer_pct / 100)
@@ -134,18 +139,26 @@ class RiskEngine:
         positions: list[Position],
         available_cash: float,
     ) -> RiskDecision:
-        max_position_pct = (
-            self.settings.risk.max_crypto_position_pct
-            if candidate.asset_class == AssetClass.CRYPTO
-            else self.settings.risk.max_position_pct
-        )
+        if candidate.metadata.get("day_trade"):
+            max_position_pct = self.settings.day_trading.max_position_pct
+        else:
+            max_position_pct = (
+                self.settings.risk.max_crypto_position_pct
+                if candidate.asset_class == AssetClass.CRYPTO
+                else self.settings.risk.max_position_pct
+            )
         max_position_value = account.equity * (max_position_pct / 100)
         existing = self._position_value(candidate.symbol, positions)
         remaining_position_capacity = max(max_position_value - existing, 0)
         if remaining_position_capacity <= 0:
             return self._reject(candidate, "Position cap already reached.")
 
-        risk_budget = account.equity * (self.settings.risk.max_risk_per_trade_pct / 100)
+        risk_per_trade_pct = (
+            self.settings.day_trading.risk_per_trade_pct
+            if candidate.metadata.get("day_trade")
+            else self.settings.risk.max_risk_per_trade_pct
+        )
+        risk_budget = account.equity * (risk_per_trade_pct / 100)
         if candidate.stop_price and candidate.stop_price < candidate.entry_price:
             per_unit_risk = candidate.entry_price - candidate.stop_price
             qty_by_risk = risk_budget / per_unit_risk
