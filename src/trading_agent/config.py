@@ -71,6 +71,8 @@ class StrategyConfig(BaseModel):
     allow_crypto: bool = True
     allow_short: bool = False
     min_signal_score: float = Field(default=70.0, ge=0, le=100)
+    max_option_entry_orders_per_underlying_per_day: int = Field(default=1, ge=0)
+    option_loss_cooldown_minutes: int = Field(default=1440, ge=0)
 
 
 class ScreenerConfig(BaseModel):

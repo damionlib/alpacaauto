@@ -261,12 +261,20 @@ mode = "live"
 - Max stock/ETF position: 12% of equity
 - Max crypto position: 10% of equity
 - Max options premium per trade: 2% of equity
+- Max option entry orders per underlying per day: 1
+- Option loss cooldown: 1440 minutes before another option entry on the same underlying
 - Max entry slippage: 0.5% (entries are submitted as marketable limit orders, not pure market orders, so a gap or thin quote cannot fill far from the price the sizing and stop math assumed)
 
 Per-trade caps are also enforced in aggregate across a single cycle: a shared cash
 budget (spendable balance minus the cash buffer) is decremented as each order is
 submitted, so the agent cannot approve several entries that each assume the full
 buffer.
+
+Option entries are also guarded by underlying, not only by exact contract symbol:
+an open or pending option order for `CDNS` blocks another `CDNS` option entry, and
+a losing option exit signal starts the same-underlying cooldown. This avoids
+repeatedly opening new spreads on the same name after the first idea has already
+failed.
 
 ### Daily Loss Stop Behavior
 

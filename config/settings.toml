@@ -52,6 +52,8 @@ allow_options = true
 allow_crypto = true
 allow_short = true
 min_signal_score = 70.0
+max_option_entry_orders_per_underlying_per_day = 1
+option_loss_cooldown_minutes = 1440
 
 [screener]
 enabled = true

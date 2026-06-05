@@ -306,6 +306,22 @@ class AuditStore:
             ).fetchall()
         return [self._event_row(row) for row in rows]
 
+    def submitted_orders_since(self, since: datetime) -> list[dict[str, Any]]:
+        since_text = since.astimezone(UTC).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                select *
+                from audit_events
+                where event_type = 'order'
+                  and status = 'submitted'
+                  and created_at >= ?
+                order by id desc
+                """,
+                (since_text,),
+            ).fetchall()
+        return [self._event_row(row) for row in rows]
+
     def latest_day_trade_entry_for_symbol(self, symbol: str, since: datetime) -> dict[str, Any] | None:
         since_text = since.astimezone(UTC).isoformat()
         with self._connect() as connection:

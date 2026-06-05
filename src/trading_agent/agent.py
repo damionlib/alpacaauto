@@ -4,7 +4,7 @@ import asyncio
 import uuid
 from collections import defaultdict
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 from rich.console import Console
 from rich.table import Table
@@ -1135,14 +1135,22 @@ class TradingAgent:
             open_orders = await self.broker.get_open_orders()
         except Exception as exc:
             self.console.print(f"[yellow]open-order check failed[/yellow] {exc}")
-            return {"symbols": set(), "covered_call_contracts_by_underlying": {}, "orders": []}
+            return {
+                "symbols": set(),
+                "option_underlyings": set(),
+                "covered_call_contracts_by_underlying": {},
+                "orders": [],
+            }
 
         symbols = set()
+        option_underlyings = set()
         covered_call_contracts_by_underlying: dict[str, int] = {}
         for order in open_orders:
             side = str(order.get("side") or "")
             qty = int(float(order.get("qty") or 0))
-            symbols.update(self._order_symbols(order))
+            order_symbols = self._order_symbols(order)
+            symbols.update(order_symbols)
+            option_underlyings.update(self._option_underlyings_from_symbols(order_symbols))
             parsed = self._parse_option_symbol(str(order.get("symbol") or ""))
             is_covered_call_order = self._strategy_from_order(order) == "covered_call"
             if is_covered_call_order and side == "sell" and parsed and parsed["type"] == "C":
@@ -1162,6 +1170,7 @@ class TradingAgent:
                     )
         return {
             "symbols": symbols,
+            "option_underlyings": option_underlyings,
             "covered_call_contracts_by_underlying": covered_call_contracts_by_underlying,
             "orders": open_orders,
         }
@@ -1176,6 +1185,9 @@ class TradingAgent:
             return None
         if decision.intent.symbol in open_orders["symbols"]:
             return "Open order already exists for this symbol."
+        option_reason = self._option_underlying_block_reason(decision, open_orders)
+        if option_reason:
+            return option_reason
         if decision.candidate.strategy != "covered_call":
             return None
 
@@ -1196,6 +1208,112 @@ class TradingAgent:
                 message += f" {already_written} call(s) already written against this underlying."
             return message
         return None
+
+    def _option_underlying_block_reason(self, decision: RiskDecision, open_orders: dict) -> str | None:
+        if decision.candidate.asset_class != AssetClass.OPTION:
+            return None
+        underlying = self._option_underlying_from_decision(decision)
+        if not underlying:
+            return None
+        if underlying in open_orders.get("option_underlyings", set()):
+            return f"Open option order already exists for {underlying}."
+        if not getattr(self, "settings", None):
+            return None
+        daily_limit = self.settings.strategy.max_option_entry_orders_per_underlying_per_day
+        if daily_limit and self._option_entry_orders_today(underlying) >= daily_limit:
+            return (
+                f"Daily option entry cap reached for {underlying} "
+                f"({daily_limit}/{daily_limit} already submitted today)."
+            )
+        cooldown_reason = self._option_loss_cooldown_reason(underlying)
+        if cooldown_reason:
+            return cooldown_reason
+        return None
+
+    def _option_underlying_from_decision(self, decision: RiskDecision) -> str | None:
+        metadata_underlying = decision.candidate.metadata.get("underlying")
+        if metadata_underlying:
+            return str(metadata_underlying)
+        symbols = self._decision_order_symbols(decision)
+        underlyings = self._option_underlyings_from_symbols(symbols)
+        return sorted(underlyings)[0] if underlyings else None
+
+    def _option_underlyings_from_symbols(self, symbols: Iterable[str]) -> set[str]:
+        underlyings = set()
+        for symbol in symbols:
+            parsed = self._parse_option_symbol(str(symbol or ""))
+            if parsed:
+                underlyings.add(parsed["underlying"])
+        return underlyings
+
+    def _option_entry_orders_today(self, underlying: str) -> int:
+        if not self.audit:
+            return 0
+        count = 0
+        for event in self.audit.submitted_orders_since(start_of_trading_day()):
+            payload = event.get("payload") or {}
+            intent = payload.get("intent") or {}
+            metadata = intent.get("metadata") or {}
+            if metadata.get("exit"):
+                continue
+            if str(intent.get("asset_class") or "") != AssetClass.OPTION:
+                continue
+            if self._option_underlying_from_payload(event, intent, metadata) == underlying:
+                count += 1
+        return count
+
+    def _option_loss_cooldown_reason(self, underlying: str) -> str | None:
+        if not self.audit:
+            return None
+        minutes = self.settings.strategy.option_loss_cooldown_minutes
+        if not minutes:
+            return None
+        since = datetime.now(UTC) - timedelta(minutes=minutes)
+        for event in self.audit.events(event_type="risk_decision", status="approved", limit=1_000):
+            created_at = self._parse_timestamp(str(event.get("created_at") or ""))
+            if not created_at or created_at < since:
+                continue
+            payload = event.get("payload") or {}
+            candidate = payload.get("candidate") or {}
+            metadata = candidate.get("metadata") or {}
+            if not metadata.get("exit"):
+                continue
+            if self._option_underlying_from_payload(event, candidate, metadata) != underlying:
+                continue
+            metrics = metadata.get("metrics") or {}
+            pnl_pct = self._coerce_float(metrics.get("pnl_pct"))
+            if pnl_pct is not None and pnl_pct < 0:
+                return (
+                    f"Option loss cooldown active for {underlying}: last exit signal was "
+                    f"{pnl_pct:.2f}% within {minutes} minutes."
+                )
+        return None
+
+    def _option_underlying_from_payload(
+        self,
+        event: dict,
+        item: dict,
+        metadata: dict,
+    ) -> str | None:
+        underlying = metadata.get("underlying")
+        if underlying:
+            return str(underlying)
+        symbols = {str(event.get("symbol") or ""), str(item.get("symbol") or "")}
+        for leg in metadata.get("legs") or []:
+            symbols.add(str(leg.get("symbol") or ""))
+        underlyings = self._option_underlyings_from_symbols(symbols)
+        return sorted(underlyings)[0] if underlyings else None
+
+    def _parse_timestamp(self, value: str) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
 
     def _short_call_contracts(self, underlying: str, positions: list[Position]) -> int:
         underlying = str(underlying or "")
