@@ -15,10 +15,15 @@ class PositionManager:
         self.audit = audit
         self._memory_state: dict[str, dict] = {}
 
-    def evaluate(self, positions: list[Position]) -> list[TradeCandidate]:
+    def evaluate(
+        self,
+        positions: list[Position],
+        skip_symbols: set[str] | None = None,
+    ) -> list[TradeCandidate]:
         if not self.settings.position_manager.enabled:
             return []
 
+        skip_symbols = skip_symbols or set()
         candidates: list[TradeCandidate] = []
         paired_option_symbols: set[str] = set()
         if self.settings.position_manager.manage_options:
@@ -27,6 +32,8 @@ class PositionManager:
 
         for position in positions:
             if position.qty == 0:
+                continue
+            if position.symbol in skip_symbols:
                 continue
             if position.asset_class == AssetClass.OPTION and not self.settings.position_manager.manage_options:
                 continue

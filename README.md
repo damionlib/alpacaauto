@@ -99,7 +99,29 @@ Exit candidates still pass through the risk engine before execution and are save
 
 ## Day Trading
 
-Day trading is an optional paper-first mode for stock/ETF trades that are intended to be opened and closed the same day. It is disabled by default.
+Day trading is an optional paper-first mode for stock/ETF trades that are intended to be opened and closed the same day.
+
+**Intraday data.** The day-trade engine scores setups from intraday inputs — VWAP,
+relative volume, short-term trend, opening-range break, and bid/ask spread. When
+`day_trading.enabled = true`, the agent fetches a latest quote plus today's 1-minute
+bars and attaches these to the snapshot **only for the handful of symbols that reach
+day-trade evaluation** (so it stays cheap). Without this data the engine runs blind
+on daily candles and its strict gates never clear — do not "fix" that by lowering the
+score thresholds; feed it real intraday data instead.
+
+**Regime gate.** Day-trade entries run on their own intraday signals, so the broad
+`[regime]` daily-SMA gate does **not** block them by default (`regime.apply_to_day_trades
+= false`). Set it true to also require the daily uptrend for day trades.
+
+**Exit ownership.** Day-trade positions are managed only by the day-trade engine; the
+swing position manager skips any symbol that has a day-trade entry today, so a single
+position is never exited by two engines with conflicting rules.
+
+**Independent daily-loss halt.** Day trading is gated on the day-trade book's *own*
+daily P/L (open day-trade positions + today's realized day-trade exits), not the
+shared account P/L. A swing drawdown that trips the swing daily-loss stop or the
+drawdown circuit breaker halts swing entries but leaves day trading running (and vice
+versa), so the two books can be evaluated independently even when run together.
 
 Configured in `config/settings.toml`:
 

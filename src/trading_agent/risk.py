@@ -29,13 +29,17 @@ class RiskEngine:
         if candidate.metadata.get("exit"):
             return self._evaluate_exit(candidate, positions)
 
-        max_daily_loss_pct = (
-            self.settings.day_trading.max_daily_loss_pct
-            if candidate.metadata.get("day_trade")
-            else self.settings.risk.max_daily_loss_pct
-        )
-        if account.daily_pl_pct <= -max_daily_loss_pct:
-            return self._reject(candidate, f"Daily loss stop reached: {account.daily_pl_pct:.2f}%.")
+        if candidate.metadata.get("day_trade"):
+            # Gate day trades on the day-trade book's OWN daily P/L (stamped by the
+            # agent), not the shared account P/L — so a swing drawdown does not shut
+            # off day trading. Falls back to account P/L when not stamped.
+            max_daily_loss_pct = self.settings.day_trading.max_daily_loss_pct
+            daily_pl_pct = float(candidate.metadata.get("day_trade_daily_pl_pct", account.daily_pl_pct))
+        else:
+            max_daily_loss_pct = self.settings.risk.max_daily_loss_pct
+            daily_pl_pct = account.daily_pl_pct
+        if daily_pl_pct <= -max_daily_loss_pct:
+            return self._reject(candidate, f"Daily loss stop reached: {daily_pl_pct:.2f}%.")
 
         cash_buffer = account.equity * (self.settings.risk.min_cash_buffer_pct / 100)
         spendable_balance = min(account.cash, account.buying_power)

@@ -181,6 +181,9 @@ class RegimeConfig(BaseModel):
     benchmark_symbol: str = "SPY"
     sma_period: int = Field(default=50, ge=5, le=200)
     block_equity_entries_in_downtrend: bool = True
+    # Day trading runs on its own intraday-timeframe signals, so by default the
+    # daily-SMA gate does not block day-trade entries. Set true to apply it.
+    apply_to_day_trades: bool = False
 
 
 class Settings(BaseModel):

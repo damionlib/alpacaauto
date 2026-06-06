@@ -78,59 +78,85 @@ class TradingAgent:
         # protective stop/take-profit legs of bracket orders, which would leave
         # open positions unguarded on exactly the worst day. The position manager
         # still runs below to actively trim/exit losers.
-        halt_reasons: list[str] = []
+        swing_halt_reasons: list[str] = []
         if account.daily_pl_pct <= -self.settings.risk.max_daily_loss_pct:
-            halt_reasons.append(f"Daily loss stop reached: {account.daily_pl_pct:.2f}%.")
+            swing_halt_reasons.append(f"Daily loss stop reached: {account.daily_pl_pct:.2f}%.")
         drawdown_halt, drawdown_info = self._drawdown_halt(account)
         if drawdown_halt:
-            halt_reasons.append(
+            swing_halt_reasons.append(
                 f"Drawdown circuit breaker: equity {drawdown_info['drawdown_pct']:.2f}% below "
                 f"trailing peak {drawdown_info['peak']:,.2f}."
             )
-        halt_entries = bool(halt_reasons)
-        if halt_entries:
-            reason = " ".join(halt_reasons)
-            self.console.print(f"[red]entries halted[/red] {reason} managing exits only")
+        swing_halt = bool(swing_halt_reasons)
+
+        # Day trading is gated on its OWN daily P/L, so a swing drawdown does not
+        # shut it off — and a bad day-trade day does not halt swing.
+        day_trade_pl_pct = self._day_trade_daily_pl_pct(account, positions)
+        day_trade_halt = (
+            self.settings.day_trading.enabled
+            and day_trade_pl_pct <= -self.settings.day_trading.max_daily_loss_pct
+        )
+
+        if swing_halt or day_trade_halt:
+            reasons = list(swing_halt_reasons)
+            if day_trade_halt:
+                reasons.append(f"Day-trade daily loss stop: {day_trade_pl_pct:.2f}%.")
+            self.console.print(f"[red]entries halted[/red] {' '.join(reasons)} managing exits only")
             self._audit_event(
                 cycle_id,
                 "risk_stop",
-                {"account": account, "positions": positions, "drawdown": drawdown_info},
+                {
+                    "account": account,
+                    "positions": positions,
+                    "drawdown": drawdown_info,
+                    "day_trade_pl_pct": day_trade_pl_pct,
+                },
                 status="triggered",
-                reason=reason,
+                reason=" ".join(reasons),
             )
-            await self._cancel_opening_orders_for_halt(cycle_id)
+            await self._cancel_opening_orders_for_halt(
+                cycle_id, cancel_swing=swing_halt, cancel_day_trade=day_trade_halt
+            )
         try:
             if self.audit:
                 self.audit.reconcile_position_states({position.symbol for position in positions})
+            # The day-trade engine manages its own positions; tell the swing
+            # position manager to skip them so a single position isn't exited by
+            # two engines with different rules.
+            day_trade_symbols = self._day_trade_symbols_today()
             exit_candidates = [
-                *self.position_manager.evaluate(positions),
+                *self.position_manager.evaluate(positions, skip_symbols=day_trade_symbols),
                 *await self._day_trade_exit_candidates(positions, cycle_id),
             ]
             for candidate in exit_candidates:
                 self._audit_candidate(cycle_id, candidate)
 
-            equity_entries_allowed = True
-            if not halt_entries:
-                regime_ok, regime_info = await self._market_regime_ok()
-                if self.settings.regime.enabled:
-                    self._audit_event(
-                        cycle_id,
-                        "market_regime",
-                        regime_info,
-                        symbol=self.settings.regime.benchmark_symbol,
-                        status="uptrend" if regime_ok else "downtrend",
-                        reason=regime_info.get("note"),
+            day_trading_enabled = self.settings.day_trading.enabled
+            skip_generation = swing_halt and (day_trade_halt or not day_trading_enabled)
+            entry_candidates: list[TradeCandidate] = []
+            if not skip_generation:
+                equity_entries_allowed = False
+                if not swing_halt:
+                    regime_ok, regime_info = await self._market_regime_ok()
+                    if self.settings.regime.enabled:
+                        self._audit_event(
+                            cycle_id,
+                            "market_regime",
+                            regime_info,
+                            symbol=self.settings.regime.benchmark_symbol,
+                            status="uptrend" if regime_ok else "downtrend",
+                            reason=regime_info.get("note"),
+                        )
+                    equity_entries_allowed = (
+                        regime_ok or not self.settings.regime.block_equity_entries_in_downtrend
                     )
-                equity_entries_allowed = (
-                    regime_ok or not self.settings.regime.block_equity_entries_in_downtrend
-                )
-            entry_candidates = (
-                []
-                if halt_entries
-                else await self._generate_candidates(
+                generated = await self._generate_candidates(
                     positions, cycle_id, equity_entries_allowed=equity_entries_allowed
                 )
-            )
+                entry_candidates = self._apply_halt_filter(generated, swing_halt, day_trade_halt)
+                for candidate in entry_candidates:
+                    if candidate.metadata.get("day_trade"):
+                        candidate.metadata["day_trade_daily_pl_pct"] = day_trade_pl_pct
             candidates = [*exit_candidates, *entry_candidates]
             decisions = [self.risk.evaluate(candidate, account, positions) for candidate in candidates]
             for decision in decisions:
@@ -141,7 +167,9 @@ class TradingAgent:
                 await self._submit_decisions(decisions, account, cycle_id, positions)
                 await self._sync_recent_order_updates(cycle_id)
             if self.audit and cycle_id:
-                self.audit.finish_cycle(cycle_id, status="stopped" if halt_entries else "completed")
+                self.audit.finish_cycle(
+                    cycle_id, status="stopped" if (swing_halt or day_trade_halt) else "completed"
+                )
             return decisions
         except Exception as exc:
             if self.audit and cycle_id:
@@ -161,6 +189,64 @@ class TradingAgent:
         if drawdown_pct >= cfg.max_drawdown_halt_pct:
             return True, {"peak": peak, "equity": account.equity, "drawdown_pct": drawdown_pct}
         return False, {}
+
+    async def _enrich_intraday(self, market) -> None:
+        """Populate day-trade intraday inputs (VWAP, relative volume, spread, etc.)
+        on the snapshot when day trading is on. Only equity/ETF symbols, and only
+        the handful that reach day-trade evaluation, so it stays cheap."""
+        if not self.settings.day_trading.enabled:
+            return
+        if market.asset_class not in {AssetClass.EQUITY, AssetClass.ETF}:
+            return
+        getter = getattr(self.broker, "get_intraday_features", None)
+        if getter is None:
+            return
+        try:
+            features = await getter(market.symbol, market.metadata.get("volumes", []))
+        except Exception as exc:
+            self.console.print(f"[yellow]intraday data unavailable for {market.symbol}[/yellow] {exc}")
+            return
+        if features:
+            market.metadata.update(features)
+
+    def _day_trade_symbols_today(self) -> set[str]:
+        if not self.audit or not self.settings.day_trading.enabled:
+            return set()
+        entries = self.audit.day_trade_entries_since(start_of_trading_day())
+        return {str(entry.get("symbol") or "") for entry in entries if entry.get("symbol")}
+
+    def _day_trade_daily_pl_pct(self, account, positions: list[Position]) -> float:
+        """The day-trade book's own P/L for the day, as a % of equity: open
+        day-trade positions' unrealized P/L plus today's realized day-trade exits.
+        Used so the swing daily-loss stop does not also halt day trading."""
+        if not account.equity or not self.settings.day_trading.enabled:
+            return 0.0
+        symbols = self._day_trade_symbols_today()
+        open_pl = sum(
+            float(position.unrealized_pl or 0)
+            for position in positions
+            if position.symbol in symbols
+        )
+        realized = self.audit.day_trade_realized_pl_since(start_of_trading_day()) if self.audit else 0.0
+        return (open_pl + realized) / account.equity * 100
+
+    def _apply_halt_filter(
+        self,
+        candidates: list[TradeCandidate],
+        swing_halt: bool,
+        day_trade_halt: bool,
+    ) -> list[TradeCandidate]:
+        if not swing_halt and not day_trade_halt:
+            return candidates
+        kept: list[TradeCandidate] = []
+        for candidate in candidates:
+            is_day_trade = bool(candidate.metadata.get("day_trade"))
+            if is_day_trade and day_trade_halt:
+                continue
+            if not is_day_trade and swing_halt:
+                continue
+            kept.append(candidate)
+        return kept
 
     async def _market_regime_ok(self) -> tuple[bool, dict]:
         cfg = self.settings.regime
@@ -236,6 +322,7 @@ class TradingAgent:
                 raw_symbol_candidates.append(catalyst_entry)
             day_trading = getattr(self, "day_trading", None)
             if day_trading:
+                await self._enrich_intraday(market)
                 day_trade_candidate, day_trade_signal = day_trading.evaluate_entry(
                     market,
                     research,
@@ -289,11 +376,26 @@ class TradingAgent:
                 for candidate, reason in blocked_options:
                     self._audit_candidate(cycle_id, candidate, status="blocked", reason=reason)
                 candidates.extend(option_candidates)
-        if not equity_entries_allowed:
-            # Broad market is in a downtrend: drop equity/ETF/option longs, keep
-            # crypto (which has its own regime logic).
-            candidates = [c for c in candidates if c.asset_class == AssetClass.CRYPTO]
+        candidates = self._apply_regime_filter(candidates, equity_entries_allowed)
         return sorted(candidates, key=lambda candidate: candidate.score, reverse=True)
+
+    def _apply_regime_filter(
+        self,
+        candidates: list[TradeCandidate],
+        equity_entries_allowed: bool,
+    ) -> list[TradeCandidate]:
+        if equity_entries_allowed:
+            return candidates
+        # Broad market is in a downtrend: drop equity/ETF/option swing longs. Keep
+        # crypto (its own regime logic) and — unless explicitly told to apply the
+        # daily-SMA gate to day trades — keep day-trade candidates, which run on
+        # their own intraday-timeframe signals.
+        keep_day_trades = not self.settings.regime.apply_to_day_trades
+        return [
+            c
+            for c in candidates
+            if c.asset_class == AssetClass.CRYPTO or (keep_day_trades and c.metadata.get("day_trade"))
+        ]
 
     def _has_non_day_trade_entry(self, candidates: list[TradeCandidate], symbol: str) -> bool:
         return any(
@@ -343,6 +445,7 @@ class TradingAgent:
             if not entry_event:
                 continue
             market = await self.broker.get_market_snapshot(position.symbol)
+            await self._enrich_intraday(market)
             self._audit_event(
                 cycle_id,
                 "market_snapshot",
@@ -877,7 +980,13 @@ class TradingAgent:
         except (TypeError, ValueError):
             return None
 
-    async def _cancel_opening_orders_for_halt(self, cycle_id: int | None) -> None:
+    async def _cancel_opening_orders_for_halt(
+        self,
+        cycle_id: int | None,
+        *,
+        cancel_swing: bool = True,
+        cancel_day_trade: bool = True,
+    ) -> None:
         try:
             open_orders = await self.broker.get_open_orders()
         except Exception as exc:
@@ -893,6 +1002,13 @@ class TradingAgent:
 
         for order in open_orders:
             if not self._is_opening_order(order):
+                continue
+            # Only cancel orders for the book that is actually halted, so a swing
+            # halt doesn't wipe working day-trade entries (and vice versa).
+            is_day_trade = self._strategy_from_order(order) == "day_trade_entry"
+            if is_day_trade and not cancel_day_trade:
+                continue
+            if not is_day_trade and not cancel_swing:
                 continue
             order_id = str(order.get("id") or "")
             if not order_id:

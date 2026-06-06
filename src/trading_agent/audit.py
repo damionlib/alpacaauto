@@ -306,6 +306,36 @@ class AuditStore:
             "exit_orders": exit_orders,
         }
 
+    def day_trade_realized_pl_since(self, since: datetime) -> float:
+        """Approximate realized P/L from today's day-trade exits, using the position
+        snapshot captured when each exit was submitted (the agent's exit-signal P/L)."""
+        since_text = since.astimezone(UTC).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                select payload_json
+                from audit_events
+                where event_type = 'order'
+                  and status = 'submitted'
+                  and strategy = 'day_trade_exit'
+                  and created_at >= ?
+                """,
+                (since_text,),
+            ).fetchall()
+        total = 0.0
+        for row in rows:
+            payload = self._loads(row["payload_json"]) or {}
+            intent = payload.get("intent") or {}
+            metadata = intent.get("metadata") or {}
+            position = metadata.get("position") or {}
+            pnl = position.get("unrealized_pl")
+            if pnl is not None:
+                try:
+                    total += float(pnl)
+                except (TypeError, ValueError):
+                    continue
+        return total
+
     def day_trade_entries_since(self, since: datetime) -> list[dict[str, Any]]:
         since_text = since.astimezone(UTC).isoformat()
         with self._connect() as connection:

@@ -15,7 +15,7 @@ live_max_total_orders_per_day = 6
 
 [audit]
 enabled = true
-database_path = "data/trading_agent_paper_clean_20260602.sqlite3"
+database_path = "data/trading_agent_paper_clean_20260606.sqlite3"
 
 [position_manager]
 enabled = true
@@ -56,6 +56,8 @@ enabled = true
 benchmark_symbol = "SPY"
 sma_period = 50
 block_equity_entries_in_downtrend = true
+# Day trades use intraday signals, so the daily-SMA gate skips them by default.
+apply_to_day_trades = false
 
 [strategy]
 symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "BTC/USD", "ETH/USD"]
