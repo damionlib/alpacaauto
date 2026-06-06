@@ -43,6 +43,14 @@ class RiskEngine:
         if candidate.side == OrderSide.BUY and available_cash <= 0:
             return self._reject(candidate, "Cash/buying-power buffer would be breached.")
 
+        if candidate.side == OrderSide.BUY:
+            ok, exposure, cap = self._correlated_exposure_ok(candidate, account, positions)
+            if not ok:
+                return self._reject(
+                    candidate,
+                    f"Correlated-group exposure cap reached: ${exposure:,.0f} of ${cap:,.0f} already deployed.",
+                )
+
         if candidate.asset_class in {AssetClass.EQUITY, AssetClass.ETF, AssetClass.CRYPTO}:
             return self._evaluate_spot(candidate, account, positions, available_cash)
         if candidate.asset_class == AssetClass.OPTION:
@@ -335,6 +343,37 @@ class RiskEngine:
 
     def _client_order_id(self, candidate: TradeCandidate) -> str:
         return f"ta-{candidate.strategy}-{uuid.uuid4().hex[:16]}"
+
+    def _group_for(self, symbol: str) -> set[str] | None:
+        symbol = (symbol or "").upper()
+        for group in self.settings.risk.correlated_groups:
+            members = {str(s).upper() for s in group}
+            if symbol in members:
+                return members
+        return None
+
+    def _correlated_exposure_ok(
+        self,
+        candidate: TradeCandidate,
+        account: AccountSnapshot,
+        positions: list[Position],
+    ) -> tuple[bool, float, float]:
+        cfg = self.settings.risk
+        if cfg.max_correlated_exposure_pct <= 0 or not cfg.correlated_groups:
+            return True, 0.0, 0.0
+        underlying = str(candidate.metadata.get("underlying") or candidate.symbol)
+        group = self._group_for(underlying)
+        if not group:
+            return True, 0.0, 0.0
+        cap = account.equity * (cfg.max_correlated_exposure_pct / 100)
+        exposure = 0.0
+        for position in positions:
+            sym = (position.symbol or "").upper()
+            parsed = _occ_underlying_and_type(position.symbol)
+            base = parsed[0].upper() if parsed else sym
+            if base in group or sym in group:
+                exposure += abs(position.market_value)
+        return exposure < cap, exposure, cap
 
     def _reject(self, candidate: TradeCandidate, reason: str) -> RiskDecision:
         return RiskDecision(approved=False, reason=reason, candidate=candidate)

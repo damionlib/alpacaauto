@@ -294,6 +294,32 @@ position manager still runs and can trim or close losers.
 `trading-agent cancel-open-orders` remains as a manual kill switch if you want to
 clear all working orders yourself.
 
+### Bleed-Stop Controls
+
+Several layers exist to stop a losing streak from compounding:
+
+- **Exits are never throttled.** Closing a position bypasses the daily order caps,
+  the cash budget, and the open-order checks. A risk-reducing close can always go
+  through, even when the day's order budget is spent on entries.
+- **Drawdown circuit breaker** (`risk.max_drawdown_halt_pct`, default 8%). When
+  equity falls this far below its trailing peak (over `drawdown_lookback_days`),
+  the agent halts *all* new entries until it recovers — stopping it from averaging
+  into a sustained drawdown. Distinct from the intraday daily-loss stop.
+- **Broad-market regime gate** (`[regime]`). New equity/ETF/option **longs** are
+  only opened when the benchmark (`SPY`) is above its `sma_period`-day SMA. In a
+  downtrend the agent manages exits and crypto only. Set `enabled = false` to turn
+  it off.
+- **Correlated-exposure cap** (`risk.max_correlated_exposure_pct`, default 25%).
+  Aggregate exposure to one correlated cluster (default: megacap AI/semis) is
+  capped, so the book can't load names that all fall together. Option positions
+  count toward their underlying's cluster.
+- **Pullback entries.** Equity momentum now buys pullbacks *within* an uptrend
+  (`SMA20 > SMA50`, price above `SMA50`, near the 20-SMA) instead of chasing
+  breakouts at the highs, and requires an uptrend to enter at all.
+- **Profit-lock ratchet** (`position_manager.profit_lock_steps`). Once a long
+  reaches a profit tier, it exits if the gain gives back to that tier's lock level.
+  `lock_pct` must be `< profit_pct` (validated at config load).
+
 ### Crypto Protective Stops
 
 Alpaca does not support bracket orders for crypto, so after a crypto entry fills the

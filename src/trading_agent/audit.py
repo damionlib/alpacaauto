@@ -257,6 +257,23 @@ class AuditStore:
             events = connection.execute("select count(*) from audit_events").fetchone()[0]
         return {"cycles": int(cycles), "events": int(events)}
 
+    def peak_equity_since(self, since: datetime) -> float | None:
+        since_text = since.astimezone(UTC).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                "select account_json from cycles where started_at >= ? and account_json is not null",
+                (since_text,),
+            ).fetchall()
+        peak: float | None = None
+        for row in rows:
+            data = self._loads(row["account_json"]) or {}
+            equity = data.get("equity")
+            if equity is None:
+                continue
+            equity = float(equity)
+            peak = equity if peak is None else max(peak, equity)
+        return peak
+
     def order_counts_since(self, since: datetime) -> dict[str, int]:
         since_text = since.astimezone(UTC).isoformat()
         with self._connect() as connection:

@@ -15,6 +15,7 @@ from trading_agent.brokers.alpaca import AlpacaBroker
 from trading_agent.catalyst.service import CatalystEngine
 from trading_agent.config import Settings
 from trading_agent.day_trading import DayTradingEngine
+from trading_agent.indicators import sma
 from trading_agent.models import (
     AssetClass,
     OrderIntent,
@@ -77,18 +78,25 @@ class TradingAgent:
         # protective stop/take-profit legs of bracket orders, which would leave
         # open positions unguarded on exactly the worst day. The position manager
         # still runs below to actively trim/exit losers.
-        halt_entries = account.daily_pl_pct <= -self.settings.risk.max_daily_loss_pct
-        if halt_entries:
-            self.console.print(
-                f"[red]daily loss stop reached[/red] {account.daily_pl_pct:.2f}%; "
-                "halting new entries and managing exits only"
+        halt_reasons: list[str] = []
+        if account.daily_pl_pct <= -self.settings.risk.max_daily_loss_pct:
+            halt_reasons.append(f"Daily loss stop reached: {account.daily_pl_pct:.2f}%.")
+        drawdown_halt, drawdown_info = self._drawdown_halt(account)
+        if drawdown_halt:
+            halt_reasons.append(
+                f"Drawdown circuit breaker: equity {drawdown_info['drawdown_pct']:.2f}% below "
+                f"trailing peak {drawdown_info['peak']:,.2f}."
             )
+        halt_entries = bool(halt_reasons)
+        if halt_entries:
+            reason = " ".join(halt_reasons)
+            self.console.print(f"[red]entries halted[/red] {reason} managing exits only")
             self._audit_event(
                 cycle_id,
                 "risk_stop",
-                {"account": account, "positions": positions},
+                {"account": account, "positions": positions, "drawdown": drawdown_info},
                 status="triggered",
-                reason=f"Daily loss stop reached: {account.daily_pl_pct:.2f}%.",
+                reason=reason,
             )
             await self._cancel_opening_orders_for_halt(cycle_id)
         try:
@@ -100,8 +108,28 @@ class TradingAgent:
             ]
             for candidate in exit_candidates:
                 self._audit_candidate(cycle_id, candidate)
+
+            equity_entries_allowed = True
+            if not halt_entries:
+                regime_ok, regime_info = await self._market_regime_ok()
+                if self.settings.regime.enabled:
+                    self._audit_event(
+                        cycle_id,
+                        "market_regime",
+                        regime_info,
+                        symbol=self.settings.regime.benchmark_symbol,
+                        status="uptrend" if regime_ok else "downtrend",
+                        reason=regime_info.get("note"),
+                    )
+                equity_entries_allowed = (
+                    regime_ok or not self.settings.regime.block_equity_entries_in_downtrend
+                )
             entry_candidates = (
-                [] if halt_entries else await self._generate_candidates(positions, cycle_id)
+                []
+                if halt_entries
+                else await self._generate_candidates(
+                    positions, cycle_id, equity_entries_allowed=equity_entries_allowed
+                )
             )
             candidates = [*exit_candidates, *entry_candidates]
             decisions = [self.risk.evaluate(candidate, account, positions) for candidate in candidates]
@@ -120,6 +148,44 @@ class TradingAgent:
                 self.audit.finish_cycle(cycle_id, status="failed", error=str(exc) or repr(exc))
             raise
 
+    def _drawdown_halt(self, account) -> tuple[bool, dict]:
+        cfg = self.settings.risk
+        if not self.audit or cfg.max_drawdown_halt_pct <= 0:
+            return False, {}
+        since = start_of_trading_day() - timedelta(days=cfg.drawdown_lookback_days)
+        peak = self.audit.peak_equity_since(since)
+        if not peak or peak <= 0:
+            return False, {}
+        peak = max(peak, account.equity)
+        drawdown_pct = (peak - account.equity) / peak * 100
+        if drawdown_pct >= cfg.max_drawdown_halt_pct:
+            return True, {"peak": peak, "equity": account.equity, "drawdown_pct": drawdown_pct}
+        return False, {}
+
+    async def _market_regime_ok(self) -> tuple[bool, dict]:
+        cfg = self.settings.regime
+        if not cfg.enabled:
+            return True, {"enabled": False, "note": "Regime gate disabled."}
+        try:
+            snapshot = await self.broker.get_market_snapshot(cfg.benchmark_symbol)
+        except Exception as exc:
+            return True, {"note": f"Benchmark fetch failed; allowing entries: {exc}"}
+        sma_value = sma(snapshot.closes, cfg.sma_period)
+        if sma_value is None:
+            return True, {"note": "Insufficient benchmark history; allowing entries."}
+        uptrend = snapshot.price > sma_value
+        return uptrend, {
+            "benchmark": cfg.benchmark_symbol,
+            "price": snapshot.price,
+            "sma": round(sma_value, 2),
+            "sma_period": cfg.sma_period,
+            "uptrend": uptrend,
+            "note": (
+                f"{cfg.benchmark_symbol} {snapshot.price:.2f} "
+                f"{'above' if uptrend else 'below'} SMA{cfg.sma_period} {sma_value:.2f}."
+            ),
+        }
+
     async def loop(self) -> None:
         while True:
             try:
@@ -132,6 +198,7 @@ class TradingAgent:
         self,
         positions: list[Position],
         cycle_id: int | None = None,
+        equity_entries_allowed: bool = True,
     ) -> list[TradeCandidate]:
         candidates: list[TradeCandidate] = []
         screened = await self._screened_symbols(cycle_id)
@@ -222,6 +289,10 @@ class TradingAgent:
                 for candidate, reason in blocked_options:
                     self._audit_candidate(cycle_id, candidate, status="blocked", reason=reason)
                 candidates.extend(option_candidates)
+        if not equity_entries_allowed:
+            # Broad market is in a downtrend: drop equity/ETF/option longs, keep
+            # crypto (which has its own regime logic).
+            candidates = [c for c in candidates if c.asset_class == AssetClass.CRYPTO]
         return sorted(candidates, key=lambda candidate: candidate.score, reverse=True)
 
     def _has_non_day_trade_entry(self, candidates: list[TradeCandidate], symbol: str) -> bool:
@@ -1102,14 +1173,18 @@ class TradingAgent:
         max_entry_orders: int,
         max_total_orders: int,
     ) -> str | None:
+        # Exits reduce risk — never throttle a close. (Previously the total-cap
+        # check ran first, so once the daily order budget was spent on entries,
+        # losing positions could not be closed and kept bleeding.)
+        if decision.candidate.metadata.get("exit"):
+            return None
+
         projected_total = daily_counts["total_orders"] + submitted_total + 1
         if max_total_orders and projected_total > max_total_orders:
             return (
                 f"Daily total order cap reached "
                 f"({daily_counts['total_orders']}/{max_total_orders} already submitted today)."
             )
-        if decision.candidate.metadata.get("exit"):
-            return None
 
         projected_entries = daily_counts["entry_orders"] + submitted_entries + 1
         if max_entry_orders and projected_entries > max_entry_orders:
