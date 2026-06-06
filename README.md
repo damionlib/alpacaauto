@@ -76,6 +76,12 @@ stop_loss_pct = 6.0
 take_profit_pct = 12.0
 trailing_stop_pct = 8.0
 max_holding_days = 20
+profit_lock_enabled = true
+profit_lock_steps = [
+  { profit_pct = 5.0, lock_pct = 2.0 },
+  { profit_pct = 8.0, lock_pct = 5.0 },
+  { profit_pct = 10.0, lock_pct = 8.0 }
+]
 manage_options = true
 option_stop_loss_pct = 40.0
 option_take_profit_pct = 80.0
@@ -84,6 +90,7 @@ option_take_profit_pct = 80.0
 The position manager checks:
 
 - unrealized P/L against stop-loss and take-profit thresholds
+- profit-lock tiers that protect part of a stock/ETF winner after it reaches configured profit levels
 - trailing drawdown from the tracked peak price
 - how long the position has been tracked
 - option-specific stop-loss/take-profit thresholds

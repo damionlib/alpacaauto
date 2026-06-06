@@ -43,12 +43,25 @@ class AuditConfig(BaseModel):
     database_path: str = "data/trading_agent.sqlite3"
 
 
+class ProfitLockStep(BaseModel):
+    profit_pct: float = Field(gt=0, le=500)
+    lock_pct: float = Field(ge=0, le=500)
+
+
 class PositionManagerConfig(BaseModel):
     enabled: bool = True
     stop_loss_pct: float = Field(default=6.0, gt=0, le=100)
     take_profit_pct: float = Field(default=12.0, gt=0, le=500)
     trailing_stop_pct: float = Field(default=8.0, gt=0, le=100)
     max_holding_days: int = Field(default=20, ge=0)
+    profit_lock_enabled: bool = True
+    profit_lock_steps: list[ProfitLockStep] = Field(
+        default_factory=lambda: [
+            ProfitLockStep(profit_pct=5.0, lock_pct=2.0),
+            ProfitLockStep(profit_pct=8.0, lock_pct=5.0),
+            ProfitLockStep(profit_pct=10.0, lock_pct=8.0),
+        ]
+    )
     manage_options: bool = True
     option_stop_loss_pct: float = Field(default=40.0, gt=0, le=100)
     option_take_profit_pct: float = Field(default=80.0, gt=0, le=1000)
