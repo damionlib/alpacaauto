@@ -367,3 +367,7 @@ live_max_total_orders_per_day = 6
 `max_orders_per_cycle` limits new entries per cycle. The daily caps limit submitted orders for the whole Central-time day. Exit orders count toward the total daily cap but not the daily entry cap.
 
 This software is not financial advice. It can lose money, especially if live trading is enabled.
+
+## License
+
+Released under the [MIT License](LICENSE). Copyright (c) 2026 damionlib.
