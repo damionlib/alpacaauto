@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import math
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -295,6 +296,106 @@ class AlpacaBroker:
         if bid is not None and bid > 0:
             return float(bid)
         return None
+
+    async def get_intraday_features(
+        self,
+        symbol: str,
+        daily_volumes: list[float] | None = None,
+    ) -> dict[str, Any]:
+        """Intraday inputs the day-trade engine needs: bid/ask spread, VWAP,
+        short-term trend, opening-range break, and relative volume. Each piece is
+        best-effort — a failure leaves that field absent (the engine treats it as
+        neutral) rather than breaking the snapshot."""
+        features: dict[str, Any] = {}
+        try:
+            data = await self._request(
+                "GET",
+                f"{DATA_API_BASE}/v2/stocks/{symbol}/quotes/latest",
+                params={"feed": "iex"},
+            )
+            quote = data.get("quote", {}) or {}
+            bid = self._coerce_float(quote.get("bp"))
+            ask = self._coerce_float(quote.get("ap"))
+            if bid and bid > 0:
+                features["bid"] = bid
+            if ask and ask > 0:
+                features["ask"] = ask
+        except Exception:
+            pass
+        try:
+            bars = await self._get_intraday_minute_bars(symbol)
+            if bars:
+                features.update(self._intraday_features_from_bars(bars, daily_volumes or []))
+        except Exception:
+            pass
+        return features
+
+    async def _get_intraday_minute_bars(self, symbol: str) -> list[dict[str, Any]]:
+        start = (datetime.now(UTC) - timedelta(hours=12)).isoformat()
+        data = await self._request(
+            "GET",
+            f"{DATA_API_BASE}/v2/stocks/bars",
+            params={
+                "symbols": symbol,
+                "timeframe": "1Min",
+                "start": start,
+                "feed": "iex",
+                "limit": 1000,
+            },
+        )
+        return data.get("bars", {}).get(symbol, []) or []
+
+    def _intraday_features_from_bars(
+        self,
+        bars: list[dict[str, Any]],
+        daily_volumes: list[float],
+    ) -> dict[str, Any]:
+        eastern = ZoneInfo("America/New_York")
+        today = datetime.now(eastern).date()
+        rows: list[dict[str, Any]] = []
+        for bar in bars:
+            stamp = bar.get("t")
+            if not stamp:
+                continue
+            when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).astimezone(eastern)
+            if when.date() == today and when.time() >= time(9, 30):
+                rows.append(bar)
+        if not rows:
+            return {}
+
+        closes = [float(bar["c"]) for bar in rows]
+        volumes = [float(bar.get("v") or 0) for bar in rows]
+        features: dict[str, Any] = {}
+
+        weighted = sum(float(bar.get("vw") or bar.get("c") or 0) * float(bar.get("v") or 0) for bar in rows)
+        traded = sum(volumes)
+        if traded > 0:
+            features["vwap"] = round(weighted / traded, 4)
+
+        if len(closes) >= 6 and closes[-6]:
+            features["minute_trend_pct"] = round((closes[-1] - closes[-6]) / closes[-6] * 100, 4)
+
+        opening = rows[:15]
+        if opening:
+            opening_high = max(float(bar["h"]) for bar in opening)
+            features["opening_range_break"] = bool(closes[-1] > opening_high)
+
+        recent_daily = [v for v in (daily_volumes or [])[-20:] if v]
+        avg_daily = (sum(recent_daily) / len(recent_daily)) if recent_daily else 0.0
+        if avg_daily > 0:
+            # Normalise by how much of the 390-minute session has elapsed, so a
+            # value near 1.0 means "trading at its usual pace for this time of day".
+            elapsed = max(min(len(rows) / 390.0, 1.0), 1.0 / 390.0)
+            features["relative_volume"] = round(traded / (avg_daily * elapsed), 3)
+
+        return features
+
+    @staticmethod
+    def _coerce_float(value: Any) -> float | None:
+        try:
+            return float(value) if value not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
 
     async def _get_stock_bars(self, symbols: list[str]) -> dict[str, tuple[list[float], list[float]]]:
         start = (datetime.now(UTC) - timedelta(days=100)).isoformat()

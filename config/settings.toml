@@ -15,7 +15,7 @@ live_max_total_orders_per_day = 6
 
 [audit]
 enabled = true
-database_path = "data/trading_agent_paper_clean_20260602.sqlite3"
+database_path = "data/trading_agent_paper_clean_20260606.sqlite3"
 
 [position_manager]
 enabled = true
@@ -23,6 +23,12 @@ stop_loss_pct = 6.0
 take_profit_pct = 12.0
 trailing_stop_pct = 8.0
 max_holding_days = 20
+profit_lock_enabled = true
+profit_lock_steps = [
+  { profit_pct = 5.0, lock_pct = 2.0 },
+  { profit_pct = 8.0, lock_pct = 5.0 },
+  { profit_pct = 10.0, lock_pct = 8.0 }
+]
 manage_options = true
 option_stop_loss_pct = 40.0
 option_take_profit_pct = 80.0
@@ -35,6 +41,23 @@ max_crypto_position_pct = 10.0
 max_options_premium_pct = 2.0
 min_cash_buffer_pct = 5.0
 max_entry_slippage_pct = 0.5
+# Portfolio circuit breaker: halt NEW entries when equity is this far below its
+# trailing peak (0 disables). Stops averaging into a sustained drawdown.
+max_drawdown_halt_pct = 8.0
+drawdown_lookback_days = 14
+# Cap aggregate exposure to one correlated cluster (default cluster = megacap
+# AI/semis). 0 disables. Prevents loading correlated names that fall together.
+max_correlated_exposure_pct = 25.0
+
+[regime]
+# Only open new equity/ETF/option longs when the benchmark is above its trend
+# SMA. Crypto keeps its own regime logic. Set enabled=false to disable the gate.
+enabled = true
+benchmark_symbol = "SPY"
+sma_period = 50
+block_equity_entries_in_downtrend = true
+# Day trades use intraday signals, so the daily-SMA gate skips them by default.
+apply_to_day_trades = false
 
 [strategy]
 symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "BTC/USD", "ETH/USD"]
@@ -52,6 +75,8 @@ allow_options = true
 allow_crypto = true
 allow_short = true
 min_signal_score = 70.0
+max_option_entry_orders_per_underlying_per_day = 1
+option_loss_cooldown_minutes = 1440
 
 [screener]
 enabled = true

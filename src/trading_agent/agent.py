@@ -4,7 +4,7 @@ import asyncio
 import uuid
 from collections import defaultdict
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 from rich.console import Console
 from rich.table import Table
@@ -15,6 +15,7 @@ from trading_agent.brokers.alpaca import AlpacaBroker
 from trading_agent.catalyst.service import CatalystEngine
 from trading_agent.config import Settings
 from trading_agent.day_trading import DayTradingEngine
+from trading_agent.indicators import sma
 from trading_agent.models import (
     AssetClass,
     OrderIntent,
@@ -77,32 +78,85 @@ class TradingAgent:
         # protective stop/take-profit legs of bracket orders, which would leave
         # open positions unguarded on exactly the worst day. The position manager
         # still runs below to actively trim/exit losers.
-        halt_entries = account.daily_pl_pct <= -self.settings.risk.max_daily_loss_pct
-        if halt_entries:
-            self.console.print(
-                f"[red]daily loss stop reached[/red] {account.daily_pl_pct:.2f}%; "
-                "halting new entries and managing exits only"
+        swing_halt_reasons: list[str] = []
+        if account.daily_pl_pct <= -self.settings.risk.max_daily_loss_pct:
+            swing_halt_reasons.append(f"Daily loss stop reached: {account.daily_pl_pct:.2f}%.")
+        drawdown_halt, drawdown_info = self._drawdown_halt(account)
+        if drawdown_halt:
+            swing_halt_reasons.append(
+                f"Drawdown circuit breaker: equity {drawdown_info['drawdown_pct']:.2f}% below "
+                f"trailing peak {drawdown_info['peak']:,.2f}."
             )
+        swing_halt = bool(swing_halt_reasons)
+
+        # Day trading is gated on its OWN daily P/L, so a swing drawdown does not
+        # shut it off — and a bad day-trade day does not halt swing.
+        day_trade_pl_pct = self._day_trade_daily_pl_pct(account, positions)
+        day_trade_halt = (
+            self.settings.day_trading.enabled
+            and day_trade_pl_pct <= -self.settings.day_trading.max_daily_loss_pct
+        )
+
+        if swing_halt or day_trade_halt:
+            reasons = list(swing_halt_reasons)
+            if day_trade_halt:
+                reasons.append(f"Day-trade daily loss stop: {day_trade_pl_pct:.2f}%.")
+            self.console.print(f"[red]entries halted[/red] {' '.join(reasons)} managing exits only")
             self._audit_event(
                 cycle_id,
                 "risk_stop",
-                {"account": account, "positions": positions},
+                {
+                    "account": account,
+                    "positions": positions,
+                    "drawdown": drawdown_info,
+                    "day_trade_pl_pct": day_trade_pl_pct,
+                },
                 status="triggered",
-                reason=f"Daily loss stop reached: {account.daily_pl_pct:.2f}%.",
+                reason=" ".join(reasons),
             )
-            await self._cancel_opening_orders_for_halt(cycle_id)
+            await self._cancel_opening_orders_for_halt(
+                cycle_id, cancel_swing=swing_halt, cancel_day_trade=day_trade_halt
+            )
         try:
             if self.audit:
                 self.audit.reconcile_position_states({position.symbol for position in positions})
+            # The day-trade engine manages its own positions; tell the swing
+            # position manager to skip them so a single position isn't exited by
+            # two engines with different rules.
+            day_trade_symbols = self._day_trade_symbols_today()
             exit_candidates = [
-                *self.position_manager.evaluate(positions),
+                *self.position_manager.evaluate(positions, skip_symbols=day_trade_symbols),
                 *await self._day_trade_exit_candidates(positions, cycle_id),
             ]
             for candidate in exit_candidates:
                 self._audit_candidate(cycle_id, candidate)
-            entry_candidates = (
-                [] if halt_entries else await self._generate_candidates(positions, cycle_id)
-            )
+
+            day_trading_enabled = self.settings.day_trading.enabled
+            skip_generation = swing_halt and (day_trade_halt or not day_trading_enabled)
+            entry_candidates: list[TradeCandidate] = []
+            if not skip_generation:
+                equity_entries_allowed = False
+                if not swing_halt:
+                    regime_ok, regime_info = await self._market_regime_ok()
+                    if self.settings.regime.enabled:
+                        self._audit_event(
+                            cycle_id,
+                            "market_regime",
+                            regime_info,
+                            symbol=self.settings.regime.benchmark_symbol,
+                            status="uptrend" if regime_ok else "downtrend",
+                            reason=regime_info.get("note"),
+                        )
+                    equity_entries_allowed = (
+                        regime_ok or not self.settings.regime.block_equity_entries_in_downtrend
+                    )
+                generated = await self._generate_candidates(
+                    positions, cycle_id, equity_entries_allowed=equity_entries_allowed
+                )
+                entry_candidates = self._apply_halt_filter(generated, swing_halt, day_trade_halt)
+                for candidate in entry_candidates:
+                    if candidate.metadata.get("day_trade"):
+                        candidate.metadata["day_trade_daily_pl_pct"] = day_trade_pl_pct
             candidates = [*exit_candidates, *entry_candidates]
             decisions = [self.risk.evaluate(candidate, account, positions) for candidate in candidates]
             for decision in decisions:
@@ -113,12 +167,110 @@ class TradingAgent:
                 await self._submit_decisions(decisions, account, cycle_id, positions)
                 await self._sync_recent_order_updates(cycle_id)
             if self.audit and cycle_id:
-                self.audit.finish_cycle(cycle_id, status="stopped" if halt_entries else "completed")
+                self.audit.finish_cycle(
+                    cycle_id, status="stopped" if (swing_halt or day_trade_halt) else "completed"
+                )
             return decisions
         except Exception as exc:
             if self.audit and cycle_id:
                 self.audit.finish_cycle(cycle_id, status="failed", error=str(exc) or repr(exc))
             raise
+
+    def _drawdown_halt(self, account) -> tuple[bool, dict]:
+        cfg = self.settings.risk
+        if not self.audit or cfg.max_drawdown_halt_pct <= 0:
+            return False, {}
+        since = start_of_trading_day() - timedelta(days=cfg.drawdown_lookback_days)
+        peak = self.audit.peak_equity_since(since)
+        if not peak or peak <= 0:
+            return False, {}
+        peak = max(peak, account.equity)
+        drawdown_pct = (peak - account.equity) / peak * 100
+        if drawdown_pct >= cfg.max_drawdown_halt_pct:
+            return True, {"peak": peak, "equity": account.equity, "drawdown_pct": drawdown_pct}
+        return False, {}
+
+    async def _enrich_intraday(self, market) -> None:
+        """Populate day-trade intraday inputs (VWAP, relative volume, spread, etc.)
+        on the snapshot when day trading is on. Only equity/ETF symbols, and only
+        the handful that reach day-trade evaluation, so it stays cheap."""
+        if not self.settings.day_trading.enabled:
+            return
+        if market.asset_class not in {AssetClass.EQUITY, AssetClass.ETF}:
+            return
+        getter = getattr(self.broker, "get_intraday_features", None)
+        if getter is None:
+            return
+        try:
+            features = await getter(market.symbol, market.metadata.get("volumes", []))
+        except Exception as exc:
+            self.console.print(f"[yellow]intraday data unavailable for {market.symbol}[/yellow] {exc}")
+            return
+        if features:
+            market.metadata.update(features)
+
+    def _day_trade_symbols_today(self) -> set[str]:
+        if not self.audit or not self.settings.day_trading.enabled:
+            return set()
+        entries = self.audit.day_trade_entries_since(start_of_trading_day())
+        return {str(entry.get("symbol") or "") for entry in entries if entry.get("symbol")}
+
+    def _day_trade_daily_pl_pct(self, account, positions: list[Position]) -> float:
+        """The day-trade book's own P/L for the day, as a % of equity: open
+        day-trade positions' unrealized P/L plus today's realized day-trade exits.
+        Used so the swing daily-loss stop does not also halt day trading."""
+        if not account.equity or not self.settings.day_trading.enabled:
+            return 0.0
+        symbols = self._day_trade_symbols_today()
+        open_pl = sum(
+            float(position.unrealized_pl or 0)
+            for position in positions
+            if position.symbol in symbols
+        )
+        realized = self.audit.day_trade_realized_pl_since(start_of_trading_day()) if self.audit else 0.0
+        return (open_pl + realized) / account.equity * 100
+
+    def _apply_halt_filter(
+        self,
+        candidates: list[TradeCandidate],
+        swing_halt: bool,
+        day_trade_halt: bool,
+    ) -> list[TradeCandidate]:
+        if not swing_halt and not day_trade_halt:
+            return candidates
+        kept: list[TradeCandidate] = []
+        for candidate in candidates:
+            is_day_trade = bool(candidate.metadata.get("day_trade"))
+            if is_day_trade and day_trade_halt:
+                continue
+            if not is_day_trade and swing_halt:
+                continue
+            kept.append(candidate)
+        return kept
+
+    async def _market_regime_ok(self) -> tuple[bool, dict]:
+        cfg = self.settings.regime
+        if not cfg.enabled:
+            return True, {"enabled": False, "note": "Regime gate disabled."}
+        try:
+            snapshot = await self.broker.get_market_snapshot(cfg.benchmark_symbol)
+        except Exception as exc:
+            return True, {"note": f"Benchmark fetch failed; allowing entries: {exc}"}
+        sma_value = sma(snapshot.closes, cfg.sma_period)
+        if sma_value is None:
+            return True, {"note": "Insufficient benchmark history; allowing entries."}
+        uptrend = snapshot.price > sma_value
+        return uptrend, {
+            "benchmark": cfg.benchmark_symbol,
+            "price": snapshot.price,
+            "sma": round(sma_value, 2),
+            "sma_period": cfg.sma_period,
+            "uptrend": uptrend,
+            "note": (
+                f"{cfg.benchmark_symbol} {snapshot.price:.2f} "
+                f"{'above' if uptrend else 'below'} SMA{cfg.sma_period} {sma_value:.2f}."
+            ),
+        }
 
     async def loop(self) -> None:
         while True:
@@ -132,6 +284,7 @@ class TradingAgent:
         self,
         positions: list[Position],
         cycle_id: int | None = None,
+        equity_entries_allowed: bool = True,
     ) -> list[TradeCandidate]:
         candidates: list[TradeCandidate] = []
         screened = await self._screened_symbols(cycle_id)
@@ -169,6 +322,7 @@ class TradingAgent:
                 raw_symbol_candidates.append(catalyst_entry)
             day_trading = getattr(self, "day_trading", None)
             if day_trading:
+                await self._enrich_intraday(market)
                 day_trade_candidate, day_trade_signal = day_trading.evaluate_entry(
                     market,
                     research,
@@ -222,7 +376,26 @@ class TradingAgent:
                 for candidate, reason in blocked_options:
                     self._audit_candidate(cycle_id, candidate, status="blocked", reason=reason)
                 candidates.extend(option_candidates)
+        candidates = self._apply_regime_filter(candidates, equity_entries_allowed)
         return sorted(candidates, key=lambda candidate: candidate.score, reverse=True)
+
+    def _apply_regime_filter(
+        self,
+        candidates: list[TradeCandidate],
+        equity_entries_allowed: bool,
+    ) -> list[TradeCandidate]:
+        if equity_entries_allowed:
+            return candidates
+        # Broad market is in a downtrend: drop equity/ETF/option swing longs. Keep
+        # crypto (its own regime logic) and — unless explicitly told to apply the
+        # daily-SMA gate to day trades — keep day-trade candidates, which run on
+        # their own intraday-timeframe signals.
+        keep_day_trades = not self.settings.regime.apply_to_day_trades
+        return [
+            c
+            for c in candidates
+            if c.asset_class == AssetClass.CRYPTO or (keep_day_trades and c.metadata.get("day_trade"))
+        ]
 
     def _has_non_day_trade_entry(self, candidates: list[TradeCandidate], symbol: str) -> bool:
         return any(
@@ -272,6 +445,7 @@ class TradingAgent:
             if not entry_event:
                 continue
             market = await self.broker.get_market_snapshot(position.symbol)
+            await self._enrich_intraday(market)
             self._audit_event(
                 cycle_id,
                 "market_snapshot",
@@ -544,8 +718,8 @@ class TradingAgent:
             return []
         canceled: list[dict] = []
         for order in open_orders["orders"]:
-            order_symbol = str(order.get("symbol") or "")
-            if order_symbol not in symbols:
+            order_symbols = self._order_symbols(order)
+            if not order_symbols.intersection(symbols):
                 continue
             order_id = str(order.get("id") or "")
             if not order_id:
@@ -556,6 +730,7 @@ class TradingAgent:
                 self.console.print(f"[yellow]could not cancel resting order[/yellow] {order_id}: {exc}")
                 continue
             canceled.append(order)
+            order_symbol = str(order.get("symbol") or "") or ",".join(sorted(order_symbols))
             self._audit_event(
                 cycle_id,
                 "order",
@@ -805,7 +980,13 @@ class TradingAgent:
         except (TypeError, ValueError):
             return None
 
-    async def _cancel_opening_orders_for_halt(self, cycle_id: int | None) -> None:
+    async def _cancel_opening_orders_for_halt(
+        self,
+        cycle_id: int | None,
+        *,
+        cancel_swing: bool = True,
+        cancel_day_trade: bool = True,
+    ) -> None:
         try:
             open_orders = await self.broker.get_open_orders()
         except Exception as exc:
@@ -821,6 +1002,13 @@ class TradingAgent:
 
         for order in open_orders:
             if not self._is_opening_order(order):
+                continue
+            # Only cancel orders for the book that is actually halted, so a swing
+            # halt doesn't wipe working day-trade entries (and vice versa).
+            is_day_trade = self._strategy_from_order(order) == "day_trade_entry"
+            if is_day_trade and not cancel_day_trade:
+                continue
+            if not is_day_trade and not cancel_swing:
                 continue
             order_id = str(order.get("id") or "")
             if not order_id:
@@ -853,16 +1041,33 @@ class TradingAgent:
         client_order_id = str(order.get("client_order_id") or "")
         if "protect" in client_order_id:
             return False
-        position_intent = str(order.get("position_intent") or "")
-        if position_intent.endswith("_to_open"):
+        position_intents = self._order_position_intents(order)
+        if any(intent.endswith("_to_open") for intent in position_intents):
             return True
-        if position_intent.endswith("_to_close"):
+        if any(intent.endswith("_to_close") for intent in position_intents):
             return False
         order_type = str(order.get("type") or order.get("order_type") or "")
         side = str(order.get("side") or "")
         if client_order_id.startswith("ta-") and side == "buy" and order_type not in {"stop", "stop_limit"}:
             return True
         return False
+
+    def _order_position_intents(self, order: dict) -> list[str]:
+        intents = [str(order.get("position_intent") or "")]
+        for leg in order.get("legs") or []:
+            intents.append(str(leg.get("position_intent") or ""))
+        return [intent for intent in intents if intent]
+
+    def _order_symbols(self, order: dict) -> set[str]:
+        symbols = set()
+        symbol = str(order.get("symbol") or "")
+        if symbol:
+            symbols.add(symbol)
+        for leg in order.get("legs") or []:
+            leg_symbol = str(leg.get("symbol") or "")
+            if leg_symbol:
+                symbols.add(leg_symbol)
+        return symbols
 
     def _strategy_from_order(self, order: dict) -> str | None:
         client_order_id = str(order.get("client_order_id") or "")
@@ -1084,14 +1289,18 @@ class TradingAgent:
         max_entry_orders: int,
         max_total_orders: int,
     ) -> str | None:
+        # Exits reduce risk — never throttle a close. (Previously the total-cap
+        # check ran first, so once the daily order budget was spent on entries,
+        # losing positions could not be closed and kept bleeding.)
+        if decision.candidate.metadata.get("exit"):
+            return None
+
         projected_total = daily_counts["total_orders"] + submitted_total + 1
         if max_total_orders and projected_total > max_total_orders:
             return (
                 f"Daily total order cap reached "
                 f"({daily_counts['total_orders']}/{max_total_orders} already submitted today)."
             )
-        if decision.candidate.metadata.get("exit"):
-            return None
 
         projected_entries = daily_counts["entry_orders"] + submitted_entries + 1
         if max_entry_orders and projected_entries > max_entry_orders:
@@ -1117,23 +1326,42 @@ class TradingAgent:
             open_orders = await self.broker.get_open_orders()
         except Exception as exc:
             self.console.print(f"[yellow]open-order check failed[/yellow] {exc}")
-            return {"symbols": set(), "covered_call_contracts_by_underlying": {}, "orders": []}
+            return {
+                "symbols": set(),
+                "option_underlyings": set(),
+                "covered_call_contracts_by_underlying": {},
+                "orders": [],
+            }
 
         symbols = set()
+        option_underlyings = set()
         covered_call_contracts_by_underlying: dict[str, int] = {}
         for order in open_orders:
-            symbol = str(order.get("symbol") or "")
             side = str(order.get("side") or "")
             qty = int(float(order.get("qty") or 0))
-            symbols.add(symbol)
-            parsed = self._parse_option_symbol(symbol)
-            if side == "sell" and parsed and parsed["type"] == "C":
+            order_symbols = self._order_symbols(order)
+            symbols.update(order_symbols)
+            option_underlyings.update(self._option_underlyings_from_symbols(order_symbols))
+            parsed = self._parse_option_symbol(str(order.get("symbol") or ""))
+            is_covered_call_order = self._strategy_from_order(order) == "covered_call"
+            if is_covered_call_order and side == "sell" and parsed and parsed["type"] == "C":
                 underlying = parsed["underlying"]
                 covered_call_contracts_by_underlying[underlying] = (
                     covered_call_contracts_by_underlying.get(underlying, 0) + qty
                 )
+            for leg in order.get("legs") or []:
+                leg_symbol = str(leg.get("symbol") or "")
+                leg_side = str(leg.get("side") or "")
+                leg_qty = int(float(leg.get("qty") or leg.get("ratio_qty") or qty or 0))
+                parsed = self._parse_option_symbol(leg_symbol)
+                if is_covered_call_order and leg_side == "sell" and parsed and parsed["type"] == "C":
+                    underlying = parsed["underlying"]
+                    covered_call_contracts_by_underlying[underlying] = (
+                        covered_call_contracts_by_underlying.get(underlying, 0) + leg_qty
+                    )
         return {
             "symbols": symbols,
+            "option_underlyings": option_underlyings,
             "covered_call_contracts_by_underlying": covered_call_contracts_by_underlying,
             "orders": open_orders,
         }
@@ -1148,6 +1376,9 @@ class TradingAgent:
             return None
         if decision.intent.symbol in open_orders["symbols"]:
             return "Open order already exists for this symbol."
+        option_reason = self._option_underlying_block_reason(decision, open_orders)
+        if option_reason:
+            return option_reason
         if decision.candidate.strategy != "covered_call":
             return None
 
@@ -1168,6 +1399,112 @@ class TradingAgent:
                 message += f" {already_written} call(s) already written against this underlying."
             return message
         return None
+
+    def _option_underlying_block_reason(self, decision: RiskDecision, open_orders: dict) -> str | None:
+        if decision.candidate.asset_class != AssetClass.OPTION:
+            return None
+        underlying = self._option_underlying_from_decision(decision)
+        if not underlying:
+            return None
+        if underlying in open_orders.get("option_underlyings", set()):
+            return f"Open option order already exists for {underlying}."
+        if not getattr(self, "settings", None):
+            return None
+        daily_limit = self.settings.strategy.max_option_entry_orders_per_underlying_per_day
+        if daily_limit and self._option_entry_orders_today(underlying) >= daily_limit:
+            return (
+                f"Daily option entry cap reached for {underlying} "
+                f"({daily_limit}/{daily_limit} already submitted today)."
+            )
+        cooldown_reason = self._option_loss_cooldown_reason(underlying)
+        if cooldown_reason:
+            return cooldown_reason
+        return None
+
+    def _option_underlying_from_decision(self, decision: RiskDecision) -> str | None:
+        metadata_underlying = decision.candidate.metadata.get("underlying")
+        if metadata_underlying:
+            return str(metadata_underlying)
+        symbols = self._decision_order_symbols(decision)
+        underlyings = self._option_underlyings_from_symbols(symbols)
+        return sorted(underlyings)[0] if underlyings else None
+
+    def _option_underlyings_from_symbols(self, symbols: Iterable[str]) -> set[str]:
+        underlyings = set()
+        for symbol in symbols:
+            parsed = self._parse_option_symbol(str(symbol or ""))
+            if parsed:
+                underlyings.add(parsed["underlying"])
+        return underlyings
+
+    def _option_entry_orders_today(self, underlying: str) -> int:
+        if not self.audit:
+            return 0
+        count = 0
+        for event in self.audit.submitted_orders_since(start_of_trading_day()):
+            payload = event.get("payload") or {}
+            intent = payload.get("intent") or {}
+            metadata = intent.get("metadata") or {}
+            if metadata.get("exit"):
+                continue
+            if str(intent.get("asset_class") or "") != AssetClass.OPTION:
+                continue
+            if self._option_underlying_from_payload(event, intent, metadata) == underlying:
+                count += 1
+        return count
+
+    def _option_loss_cooldown_reason(self, underlying: str) -> str | None:
+        if not self.audit:
+            return None
+        minutes = self.settings.strategy.option_loss_cooldown_minutes
+        if not minutes:
+            return None
+        since = datetime.now(UTC) - timedelta(minutes=minutes)
+        for event in self.audit.events(event_type="risk_decision", status="approved", limit=1_000):
+            created_at = self._parse_timestamp(str(event.get("created_at") or ""))
+            if not created_at or created_at < since:
+                continue
+            payload = event.get("payload") or {}
+            candidate = payload.get("candidate") or {}
+            metadata = candidate.get("metadata") or {}
+            if not metadata.get("exit"):
+                continue
+            if self._option_underlying_from_payload(event, candidate, metadata) != underlying:
+                continue
+            metrics = metadata.get("metrics") or {}
+            pnl_pct = self._coerce_float(metrics.get("pnl_pct"))
+            if pnl_pct is not None and pnl_pct < 0:
+                return (
+                    f"Option loss cooldown active for {underlying}: last exit signal was "
+                    f"{pnl_pct:.2f}% within {minutes} minutes."
+                )
+        return None
+
+    def _option_underlying_from_payload(
+        self,
+        event: dict,
+        item: dict,
+        metadata: dict,
+    ) -> str | None:
+        underlying = metadata.get("underlying")
+        if underlying:
+            return str(underlying)
+        symbols = {str(event.get("symbol") or ""), str(item.get("symbol") or "")}
+        for leg in metadata.get("legs") or []:
+            symbols.add(str(leg.get("symbol") or ""))
+        underlyings = self._option_underlyings_from_symbols(symbols)
+        return sorted(underlyings)[0] if underlyings else None
+
+    def _parse_timestamp(self, value: str) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
 
     def _short_call_contracts(self, underlying: str, positions: list[Position]) -> int:
         underlying = str(underlying or "")
@@ -1209,6 +1546,11 @@ class TradingAgent:
         positions: list[Position],
         existing_candidates: Iterable[TradeCandidate],
     ) -> list[TradeCandidate]:
+        if self._has_open_option_exposure(market.symbol, positions):
+            self.console.print(
+                f"[yellow]options skipped for {market.symbol}[/yellow] existing option exposure is already open"
+            )
+            return []
         try:
             contracts = await self.broker.get_option_contracts(market.symbol)
         except Exception as exc:
@@ -1226,6 +1568,15 @@ class TradingAgent:
             *self.options.debit_spread_candidates(market, contracts, bullish_score),
         ]
         return await self._hydrate_option_prices(candidates)
+
+    def _has_open_option_exposure(self, underlying: str, positions: list[Position]) -> bool:
+        for position in positions:
+            if position.asset_class != AssetClass.OPTION or position.qty == 0:
+                continue
+            parsed = self._parse_option_symbol(position.symbol)
+            if parsed and parsed["underlying"] == underlying:
+                return True
+        return False
 
     async def _hydrate_option_prices(self, candidates: list[TradeCandidate]) -> list[TradeCandidate]:
         priced: list[TradeCandidate] = []

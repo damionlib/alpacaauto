@@ -76,6 +76,12 @@ stop_loss_pct = 6.0
 take_profit_pct = 12.0
 trailing_stop_pct = 8.0
 max_holding_days = 20
+profit_lock_enabled = true
+profit_lock_steps = [
+  { profit_pct = 5.0, lock_pct = 2.0 },
+  { profit_pct = 8.0, lock_pct = 5.0 },
+  { profit_pct = 10.0, lock_pct = 8.0 }
+]
 manage_options = true
 option_stop_loss_pct = 40.0
 option_take_profit_pct = 80.0
@@ -84,6 +90,7 @@ option_take_profit_pct = 80.0
 The position manager checks:
 
 - unrealized P/L against stop-loss and take-profit thresholds
+- profit-lock tiers that protect part of a stock/ETF winner after it reaches configured profit levels
 - trailing drawdown from the tracked peak price
 - how long the position has been tracked
 - option-specific stop-loss/take-profit thresholds
@@ -92,7 +99,29 @@ Exit candidates still pass through the risk engine before execution and are save
 
 ## Day Trading
 
-Day trading is an optional paper-first mode for stock/ETF trades that are intended to be opened and closed the same day. It is disabled by default.
+Day trading is an optional paper-first mode for stock/ETF trades that are intended to be opened and closed the same day.
+
+**Intraday data.** The day-trade engine scores setups from intraday inputs — VWAP,
+relative volume, short-term trend, opening-range break, and bid/ask spread. When
+`day_trading.enabled = true`, the agent fetches a latest quote plus today's 1-minute
+bars and attaches these to the snapshot **only for the handful of symbols that reach
+day-trade evaluation** (so it stays cheap). Without this data the engine runs blind
+on daily candles and its strict gates never clear — do not "fix" that by lowering the
+score thresholds; feed it real intraday data instead.
+
+**Regime gate.** Day-trade entries run on their own intraday signals, so the broad
+`[regime]` daily-SMA gate does **not** block them by default (`regime.apply_to_day_trades
+= false`). Set it true to also require the daily uptrend for day trades.
+
+**Exit ownership.** Day-trade positions are managed only by the day-trade engine; the
+swing position manager skips any symbol that has a day-trade entry today, so a single
+position is never exited by two engines with conflicting rules.
+
+**Independent daily-loss halt.** Day trading is gated on the day-trade book's *own*
+daily P/L (open day-trade positions + today's realized day-trade exits), not the
+shared account P/L. A swing drawdown that trips the swing daily-loss stop or the
+drawdown circuit breaker halts swing entries but leaves day trading running (and vice
+versa), so the two books can be evaluated independently even when run together.
 
 Configured in `config/settings.toml`:
 
@@ -261,12 +290,20 @@ mode = "live"
 - Max stock/ETF position: 12% of equity
 - Max crypto position: 10% of equity
 - Max options premium per trade: 2% of equity
+- Max option entry orders per underlying per day: 1
+- Option loss cooldown: 1440 minutes before another option entry on the same underlying
 - Max entry slippage: 0.5% (entries are submitted as marketable limit orders, not pure market orders, so a gap or thin quote cannot fill far from the price the sizing and stop math assumed)
 
 Per-trade caps are also enforced in aggregate across a single cycle: a shared cash
 budget (spendable balance minus the cash buffer) is decremented as each order is
 submitted, so the agent cannot approve several entries that each assume the full
 buffer.
+
+Option entries are also guarded by underlying, not only by exact contract symbol:
+an open or pending option order for `CDNS` blocks another `CDNS` option entry, and
+a losing option exit signal starts the same-underlying cooldown. This avoids
+repeatedly opening new spreads on the same name after the first idea has already
+failed.
 
 ### Daily Loss Stop Behavior
 
@@ -278,6 +315,32 @@ position manager still runs and can trim or close losers.
 
 `trading-agent cancel-open-orders` remains as a manual kill switch if you want to
 clear all working orders yourself.
+
+### Bleed-Stop Controls
+
+Several layers exist to stop a losing streak from compounding:
+
+- **Exits are never throttled.** Closing a position bypasses the daily order caps,
+  the cash budget, and the open-order checks. A risk-reducing close can always go
+  through, even when the day's order budget is spent on entries.
+- **Drawdown circuit breaker** (`risk.max_drawdown_halt_pct`, default 8%). When
+  equity falls this far below its trailing peak (over `drawdown_lookback_days`),
+  the agent halts *all* new entries until it recovers — stopping it from averaging
+  into a sustained drawdown. Distinct from the intraday daily-loss stop.
+- **Broad-market regime gate** (`[regime]`). New equity/ETF/option **longs** are
+  only opened when the benchmark (`SPY`) is above its `sma_period`-day SMA. In a
+  downtrend the agent manages exits and crypto only. Set `enabled = false` to turn
+  it off.
+- **Correlated-exposure cap** (`risk.max_correlated_exposure_pct`, default 25%).
+  Aggregate exposure to one correlated cluster (default: megacap AI/semis) is
+  capped, so the book can't load names that all fall together. Option positions
+  count toward their underlying's cluster.
+- **Pullback entries.** Equity momentum now buys pullbacks *within* an uptrend
+  (`SMA20 > SMA50`, price above `SMA50`, near the 20-SMA) instead of chasing
+  breakouts at the highs, and requires an uptrend to enter at all.
+- **Profit-lock ratchet** (`position_manager.profit_lock_steps`). Once a long
+  reaches a profit tier, it exits if the gain gives back to that tier's lock level.
+  `lock_pct` must be `< profit_pct` (validated at config load).
 
 ### Crypto Protective Stops
 
@@ -304,3 +367,7 @@ live_max_total_orders_per_day = 6
 `max_orders_per_cycle` limits new entries per cycle. The daily caps limit submitted orders for the whole Central-time day. Exit orders count toward the total daily cap but not the daily entry cap.
 
 This software is not financial advice. It can lose money, especially if live trading is enabled.
+
+## License
+
+Released under the [MIT License](LICENSE). Copyright (c) 2026 damionlib.

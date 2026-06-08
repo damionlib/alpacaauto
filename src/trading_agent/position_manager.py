@@ -15,10 +15,15 @@ class PositionManager:
         self.audit = audit
         self._memory_state: dict[str, dict] = {}
 
-    def evaluate(self, positions: list[Position]) -> list[TradeCandidate]:
+    def evaluate(
+        self,
+        positions: list[Position],
+        skip_symbols: set[str] | None = None,
+    ) -> list[TradeCandidate]:
         if not self.settings.position_manager.enabled:
             return []
 
+        skip_symbols = skip_symbols or set()
         candidates: list[TradeCandidate] = []
         paired_option_symbols: set[str] = set()
         if self.settings.position_manager.manage_options:
@@ -27,6 +32,8 @@ class PositionManager:
 
         for position in positions:
             if position.qty == 0:
+                continue
+            if position.symbol in skip_symbols:
                 continue
             if position.asset_class == AssetClass.OPTION and not self.settings.position_manager.manage_options:
                 continue
@@ -360,6 +367,10 @@ class PositionManager:
             }
 
         if position.asset_class != AssetClass.OPTION and position.qty > 0:
+            profit_lock = self._profit_lock_exit_reason(position, metrics)
+            if profit_lock:
+                return profit_lock
+
             trailing_stop_pct = self.settings.position_manager.trailing_stop_pct
             if metrics["trailing_drawdown_pct"] >= trailing_stop_pct:
                 return {
@@ -380,6 +391,40 @@ class PositionManager:
                 ],
             }
         return None
+
+    def _profit_lock_exit_reason(self, position: Position, metrics: dict) -> dict | None:
+        if not self.settings.position_manager.profit_lock_enabled:
+            return None
+        if not position.avg_entry_price or position.avg_entry_price <= 0:
+            return None
+        pnl_pct = metrics.get("pnl_pct")
+        if pnl_pct is None:
+            return None
+
+        peak_price = float(metrics.get("peak_price") or 0)
+        peak_pnl_pct = ((peak_price - position.avg_entry_price) / position.avg_entry_price) * 100
+        active_steps = [
+            step
+            for step in self.settings.position_manager.profit_lock_steps
+            if peak_pnl_pct >= step.profit_pct
+        ]
+        if not active_steps:
+            return None
+        step = max(active_steps, key=lambda item: item.profit_pct)
+        if pnl_pct > step.lock_pct:
+            return None
+
+        return {
+            "strategy": "profit_lock_exit",
+            "score": 92,
+            "rationale": [
+                (
+                    f"Position reached {peak_pnl_pct:.2f}% profit, meeting the "
+                    f"{step.profit_pct:.2f}% profit-lock tier; current P/L "
+                    f"{pnl_pct:.2f}% is at/below the locked {step.lock_pct:.2f}% profit."
+                )
+            ],
+        }
 
     def _short_option_exit_reason(self, position: Position, metrics: dict) -> dict | None:
         pnl_pct = metrics["pnl_pct"]

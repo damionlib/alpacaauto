@@ -72,6 +72,53 @@ def test_position_manager_creates_trailing_stop_exit(tmp_path) -> None:
     assert candidates[0].strategy == "trailing_stop_exit"
 
 
+def test_position_manager_creates_profit_lock_exit(tmp_path) -> None:
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    manager = PositionManager(Settings(), store)
+    # Peak profit was 9%, activating the 8% -> lock 5% ladder tier.
+    store.update_position_state(symbol="KLAC", asset_class="equity", current_price=109)
+
+    candidates = manager.evaluate(
+        [
+            Position(
+                symbol="KLAC",
+                asset_class=AssetClass.EQUITY,
+                qty=10,
+                market_value=1_040,
+                avg_entry_price=100,
+                current_price=104,
+                unrealized_pl=40,
+            )
+        ]
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].strategy == "profit_lock_exit"
+    assert "profit-lock tier" in candidates[0].rationale[0]
+
+
+def test_position_manager_keeps_winner_above_locked_profit(tmp_path) -> None:
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    manager = PositionManager(Settings(), store)
+    store.update_position_state(symbol="KLAC", asset_class="equity", current_price=109)
+
+    candidates = manager.evaluate(
+        [
+            Position(
+                symbol="KLAC",
+                asset_class=AssetClass.EQUITY,
+                qty=10,
+                market_value=1_060,
+                avg_entry_price=100,
+                current_price=106,
+                unrealized_pl=60,
+            )
+        ]
+    )
+
+    assert candidates == []
+
+
 def test_position_manager_creates_time_exit(tmp_path) -> None:
     store = AuditStore(tmp_path / "audit.sqlite3")
     manager = PositionManager(Settings(), store)

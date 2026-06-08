@@ -27,13 +27,31 @@ def test_daily_entry_cap_blocks_new_entries() -> None:
     assert "Daily entry order cap reached" in reason
 
 
-def test_daily_total_cap_blocks_exits_too() -> None:
+def test_daily_total_cap_never_blocks_exits() -> None:
+    # Exits reduce risk and must never be throttled, even when the daily total
+    # order cap is already exhausted — otherwise losers cannot be closed.
     agent = TradingAgent.__new__(TradingAgent)
     decision = _decision(exit_trade=True)
 
     reason = agent._daily_cap_reason(
         decision,
         daily_counts={"total_orders": 6, "entry_orders": 3, "exit_orders": 3},
+        submitted_entries=0,
+        submitted_total=0,
+        max_entry_orders=3,
+        max_total_orders=6,
+    )
+
+    assert reason is None
+
+
+def test_daily_total_cap_still_blocks_entries() -> None:
+    agent = TradingAgent.__new__(TradingAgent)
+    decision = _decision(exit_trade=False)
+
+    reason = agent._daily_cap_reason(
+        decision,
+        daily_counts={"total_orders": 6, "entry_orders": 1, "exit_orders": 5},
         submitted_entries=0,
         submitted_total=0,
         max_entry_orders=3,

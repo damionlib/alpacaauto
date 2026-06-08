@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, model_validator
 
 
 class BrokerConfig(BaseModel):
@@ -43,15 +43,40 @@ class AuditConfig(BaseModel):
     database_path: str = "data/trading_agent.sqlite3"
 
 
+class ProfitLockStep(BaseModel):
+    profit_pct: float = Field(gt=0, le=500)
+    lock_pct: float = Field(ge=0, le=500)
+
+
 class PositionManagerConfig(BaseModel):
     enabled: bool = True
     stop_loss_pct: float = Field(default=6.0, gt=0, le=100)
     take_profit_pct: float = Field(default=12.0, gt=0, le=500)
     trailing_stop_pct: float = Field(default=8.0, gt=0, le=100)
     max_holding_days: int = Field(default=20, ge=0)
+    profit_lock_enabled: bool = True
+    profit_lock_steps: list[ProfitLockStep] = Field(
+        default_factory=lambda: [
+            ProfitLockStep(profit_pct=5.0, lock_pct=2.0),
+            ProfitLockStep(profit_pct=8.0, lock_pct=5.0),
+            ProfitLockStep(profit_pct=10.0, lock_pct=8.0),
+        ]
+    )
     manage_options: bool = True
     option_stop_loss_pct: float = Field(default=40.0, gt=0, le=100)
     option_take_profit_pct: float = Field(default=80.0, gt=0, le=1000)
+
+    @model_validator(mode="after")
+    def _validate_profit_lock(self) -> "PositionManagerConfig":
+        for step in self.profit_lock_steps:
+            if step.lock_pct >= step.profit_pct:
+                raise ValueError(
+                    f"profit_lock step lock_pct ({step.lock_pct}) must be < profit_pct "
+                    f"({step.profit_pct}); otherwise the position exits the instant it reaches the tier."
+                )
+        # Keep tiers ordered so the highest reached tier is well-defined.
+        self.profit_lock_steps = sorted(self.profit_lock_steps, key=lambda item: item.profit_pct)
+        return self
 
 
 class RiskConfig(BaseModel):
@@ -62,6 +87,21 @@ class RiskConfig(BaseModel):
     max_options_premium_pct: float = Field(default=2.0, gt=0, le=10)
     min_cash_buffer_pct: float = Field(default=5.0, ge=0, le=50)
     max_entry_slippage_pct: float = Field(default=0.5, ge=0, le=5)
+    # Portfolio circuit breaker: halt NEW entries when equity is down this far
+    # from its trailing peak (0 disables). Distinct from the intraday daily-loss
+    # stop — this stops averaging into a sustained drawdown.
+    max_drawdown_halt_pct: float = Field(default=8.0, ge=0, le=100)
+    drawdown_lookback_days: int = Field(default=14, ge=1, le=365)
+    # Cap aggregate exposure to a correlated cluster (0 disables).
+    max_correlated_exposure_pct: float = Field(default=25.0, ge=0, le=100)
+    correlated_groups: list[list[str]] = Field(
+        default_factory=lambda: [
+            [
+                "NVDA", "AVGO", "AMD", "MU", "AMAT", "LRCX", "KLAC", "ASML", "MRVL",
+                "TSM", "SMCI", "ORCL", "MSFT", "GOOGL", "GOOG", "META", "AAPL", "AMZN", "TSLA",
+            ]
+        ]
+    )
 
 
 class StrategyConfig(BaseModel):
@@ -71,6 +111,8 @@ class StrategyConfig(BaseModel):
     allow_crypto: bool = True
     allow_short: bool = False
     min_signal_score: float = Field(default=70.0, ge=0, le=100)
+    max_option_entry_orders_per_underlying_per_day: int = Field(default=1, ge=0)
+    option_loss_cooldown_minutes: int = Field(default=1440, ge=0)
 
 
 class ScreenerConfig(BaseModel):
@@ -132,6 +174,18 @@ class ResearchConfig(BaseModel):
     crypto_exchange_flows_enabled: bool = False
 
 
+class RegimeConfig(BaseModel):
+    # Broad-market trend gate: only open new equity/ETF/option longs when the
+    # benchmark is above its trend SMA. Stops buying longs into a falling tape.
+    enabled: bool = True
+    benchmark_symbol: str = "SPY"
+    sma_period: int = Field(default=50, ge=5, le=200)
+    block_equity_entries_in_downtrend: bool = True
+    # Day trading runs on its own intraday-timeframe signals, so by default the
+    # daily-SMA gate does not block day-trade entries. Set true to apply it.
+    apply_to_day_trades: bool = False
+
+
 class Settings(BaseModel):
     broker: BrokerConfig = Field(default_factory=BrokerConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
@@ -142,6 +196,7 @@ class Settings(BaseModel):
     screener: ScreenerConfig = Field(default_factory=ScreenerConfig)
     catalyst: CatalystConfig = Field(default_factory=CatalystConfig)
     day_trading: DayTradingConfig = Field(default_factory=DayTradingConfig)
+    regime: RegimeConfig = Field(default_factory=RegimeConfig)
     research: ResearchConfig = Field(default_factory=ResearchConfig)
     alpaca_api_key_id: SecretStr | None = None
     alpaca_api_secret_key: SecretStr | None = None

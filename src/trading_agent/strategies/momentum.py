@@ -49,16 +49,41 @@ class MomentumStrategy:
 
         headline_text = " ".join(item.title.lower() for item in research.news)
         negative_penalty = 20 if any(word in headline_text for word in NEGATIVE_WORDS) else 0
-        trend_score = 40 if market.price > sma20 > sma50 else 0
-        momentum_score = min(max(change20, 0) * 2, 30)
         quality_score = self._quality_score(market, research)
         vol_penalty = min((vol20 or 0) / 4, 20)
         crypto_adjustment = self._crypto_adjustment(market, research)
+
+        if market.asset_class == AssetClass.CRYPTO:
+            trend_score = 40 if market.price > sma20 > sma50 else 0
+            pullback_score = 0.0
+            momentum_score = min(max(change20, 0) * 2, 30)
+            extension_pct = 0.0
+        else:
+            # Buy pullbacks within an uptrend, NOT breakouts at the highs. An
+            # uptrend requires SMA20 > SMA50 and price above SMA50; entries are
+            # rewarded near/below the 20-SMA and penalized when price is stretched
+            # far above it (chasing the top — the prior behaviour that bled).
+            uptrend = sma20 > sma50 and market.price > sma50
+            extension_pct = ((market.price - sma20) / sma20 * 100) if sma20 else 0.0
+            trend_score = 35 if uptrend else 0
+            if not uptrend:
+                pullback_score = 0.0
+            elif extension_pct <= 1.5:
+                pullback_score = 18.0
+            elif extension_pct <= 4.0:
+                pullback_score = 8.0
+            elif extension_pct <= 8.0:
+                pullback_score = -8.0
+            else:
+                pullback_score = -20.0
+            momentum_score = min(max(change20, 0) * 1.5, 22)
+
         score = max(
             0.0,
             min(
                 100.0,
-                30 + trend_score + momentum_score + quality_score + crypto_adjustment - vol_penalty - negative_penalty,
+                30 + trend_score + pullback_score + momentum_score + quality_score
+                + crypto_adjustment - vol_penalty - negative_penalty,
             ),
         )
 
@@ -80,7 +105,8 @@ class MomentumStrategy:
                 stop_price=round(stop_price, 2),
                 take_profit_price=round(take_profit, 2),
                 rationale=[
-                    f"Price above trend filters: {market.price:.2f} vs SMA20 {sma20:.2f} and SMA50 {sma50:.2f}.",
+                    f"Trend/pullback: price {market.price:.2f} vs SMA20 {sma20:.2f}, SMA50 {sma50:.2f} "
+                    f"({extension_pct:.2f}% above SMA20).",
                     f"20-day change is {change20:.2f}%; annualized realized volatility is {(vol20 or 0):.2f}%.",
                     f"Negative headline penalty applied: {negative_penalty > 0}.",
                     f"Crypto regime adjustment: {crypto_adjustment:.2f}." if market.asset_class == AssetClass.CRYPTO else "SEC quality check included.",
@@ -90,6 +116,7 @@ class MomentumStrategy:
                     "sma50": sma50,
                     "change20": change20,
                     "vol20": vol20,
+                    "extension_pct": extension_pct,
                     "crypto_regime": research.crypto_summary.get("regime"),
                     "crypto_risk_flags": research.crypto_summary.get("risk_flags", []),
                 },

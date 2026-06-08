@@ -257,6 +257,23 @@ class AuditStore:
             events = connection.execute("select count(*) from audit_events").fetchone()[0]
         return {"cycles": int(cycles), "events": int(events)}
 
+    def peak_equity_since(self, since: datetime) -> float | None:
+        since_text = since.astimezone(UTC).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                "select account_json from cycles where started_at >= ? and account_json is not null",
+                (since_text,),
+            ).fetchall()
+        peak: float | None = None
+        for row in rows:
+            data = self._loads(row["account_json"]) or {}
+            equity = data.get("equity")
+            if equity is None:
+                continue
+            equity = float(equity)
+            peak = equity if peak is None else max(peak, equity)
+        return peak
+
     def order_counts_since(self, since: datetime) -> dict[str, int]:
         since_text = since.astimezone(UTC).isoformat()
         with self._connect() as connection:
@@ -289,6 +306,36 @@ class AuditStore:
             "exit_orders": exit_orders,
         }
 
+    def day_trade_realized_pl_since(self, since: datetime) -> float:
+        """Approximate realized P/L from today's day-trade exits, using the position
+        snapshot captured when each exit was submitted (the agent's exit-signal P/L)."""
+        since_text = since.astimezone(UTC).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                select payload_json
+                from audit_events
+                where event_type = 'order'
+                  and status = 'submitted'
+                  and strategy = 'day_trade_exit'
+                  and created_at >= ?
+                """,
+                (since_text,),
+            ).fetchall()
+        total = 0.0
+        for row in rows:
+            payload = self._loads(row["payload_json"]) or {}
+            intent = payload.get("intent") or {}
+            metadata = intent.get("metadata") or {}
+            position = metadata.get("position") or {}
+            pnl = position.get("unrealized_pl")
+            if pnl is not None:
+                try:
+                    total += float(pnl)
+                except (TypeError, ValueError):
+                    continue
+        return total
+
     def day_trade_entries_since(self, since: datetime) -> list[dict[str, Any]]:
         since_text = since.astimezone(UTC).isoformat()
         with self._connect() as connection:
@@ -299,6 +346,22 @@ class AuditStore:
                 where event_type = 'order'
                   and status = 'submitted'
                   and strategy = 'day_trade_entry'
+                  and created_at >= ?
+                order by id desc
+                """,
+                (since_text,),
+            ).fetchall()
+        return [self._event_row(row) for row in rows]
+
+    def submitted_orders_since(self, since: datetime) -> list[dict[str, Any]]:
+        since_text = since.astimezone(UTC).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                select *
+                from audit_events
+                where event_type = 'order'
+                  and status = 'submitted'
                   and created_at >= ?
                 order by id desc
                 """,
