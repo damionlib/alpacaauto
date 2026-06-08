@@ -172,6 +172,9 @@ class AlpacaBroker:
 
         return await self._request("POST", f"{self.trading_base_url}/v2/orders", json=payload)
 
+    async def get_clock(self) -> dict[str, Any]:
+        return await self._request("GET", f"{self.trading_base_url}/v2/clock")
+
     async def cancel_all_orders(self) -> list[dict]:
         return await self._request("DELETE", f"{self.trading_base_url}/v2/orders")
 

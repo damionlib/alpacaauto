@@ -174,6 +174,18 @@ class ResearchConfig(BaseModel):
     crypto_exchange_flows_enabled: bool = False
 
 
+class ExecutionConfig(BaseModel):
+    # Options are illiquid and badly quoted after hours and in the opening
+    # auction, which produces stale marks, bad fills, and stop-loss whipsaws.
+    # Restrict option pricing/orders to regular hours with open/close buffers.
+    market_hours_only_options: bool = True
+    open_buffer_minutes: int = Field(default=15, ge=0, le=120)
+    close_buffer_minutes: int = Field(default=10, ge=0, le=120)
+    # Reject an option candidate whose quoted bid/ask is wider than this (% of
+    # mid) — a wide quote is untrustworthy to size or fill against.
+    max_option_spread_pct: float = Field(default=25.0, gt=0, le=200)
+
+
 class RegimeConfig(BaseModel):
     # Broad-market trend gate: only open new equity/ETF/option longs when the
     # benchmark is above its trend SMA. Stops buying longs into a falling tape.
@@ -197,6 +209,7 @@ class Settings(BaseModel):
     catalyst: CatalystConfig = Field(default_factory=CatalystConfig)
     day_trading: DayTradingConfig = Field(default_factory=DayTradingConfig)
     regime: RegimeConfig = Field(default_factory=RegimeConfig)
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     research: ResearchConfig = Field(default_factory=ResearchConfig)
     alpaca_api_key_id: SecretStr | None = None
     alpaca_api_secret_key: SecretStr | None = None

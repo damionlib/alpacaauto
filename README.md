@@ -341,6 +341,13 @@ Several layers exist to stop a losing streak from compounding:
 - **Profit-lock ratchet** (`position_manager.profit_lock_steps`). Once a long
   reaches a profit tier, it exits if the gain gives back to that tier's lock level.
   `lock_pct` must be `< profit_pct` (validated at config load).
+- **Options trading window** (`[execution]`). Options are illiquid and badly
+  quoted after hours and in the opening auction, which causes stale marks, bad
+  fills, and stop whipsaws. Option entries *and* exits are only priced/submitted
+  when the market is open and outside the `open_buffer_minutes` /
+  `close_buffer_minutes` windows; an option quote wider than `max_option_spread_pct`
+  is rejected as untrustworthy. If the market clock can't be fetched, options are
+  blocked (fail-closed). Equities and crypto are unaffected.
 
 ### Crypto Protective Stops
 

@@ -59,6 +59,15 @@ block_equity_entries_in_downtrend = true
 # Day trades use intraday signals, so the daily-SMA gate skips them by default.
 apply_to_day_trades = false
 
+[execution]
+# Options are illiquid / badly quoted after hours and in the opening auction.
+# Price and trade options only during regular hours, skipping the open/close
+# buffers, and reject quotes that are implausibly wide.
+market_hours_only_options = true
+open_buffer_minutes = 15
+close_buffer_minutes = 10
+max_option_spread_pct = 25.0
+
 [strategy]
 symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "BTC/USD", "ETH/USD"]
 enabled = [

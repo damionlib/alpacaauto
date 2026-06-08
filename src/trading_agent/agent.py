@@ -5,6 +5,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from rich.console import Console
 from rich.table import Table
@@ -132,6 +133,18 @@ class TradingAgent:
                 self._audit_candidate(cycle_id, candidate)
 
             day_trading_enabled = self.settings.day_trading.enabled
+            # Trustworthy options window (market open, past the open/close buffers).
+            # Gates option entry generation AND option order submission so options
+            # are never priced/traded on stale after-hours or open-auction marks.
+            options_window_ok, options_window_info = await self._options_window()
+            self._audit_event(
+                cycle_id,
+                "options_window",
+                options_window_info,
+                status="open" if options_window_ok else "closed",
+                reason=options_window_info.get("note"),
+            )
+
             skip_generation = swing_halt and (day_trade_halt or not day_trading_enabled)
             entry_candidates: list[TradeCandidate] = []
             if not skip_generation:
@@ -151,7 +164,10 @@ class TradingAgent:
                         regime_ok or not self.settings.regime.block_equity_entries_in_downtrend
                     )
                 generated = await self._generate_candidates(
-                    positions, cycle_id, equity_entries_allowed=equity_entries_allowed
+                    positions,
+                    cycle_id,
+                    equity_entries_allowed=equity_entries_allowed,
+                    options_window_ok=options_window_ok,
                 )
                 entry_candidates = self._apply_halt_filter(generated, swing_halt, day_trade_halt)
                 for candidate in entry_candidates:
@@ -164,7 +180,9 @@ class TradingAgent:
             self._print_decisions(account, decisions, analysis_time)
 
             if self.settings.agent.execute_orders:
-                await self._submit_decisions(decisions, account, cycle_id, positions)
+                await self._submit_decisions(
+                    decisions, account, cycle_id, positions, options_window_ok=options_window_ok
+                )
                 await self._sync_recent_order_updates(cycle_id)
             if self.audit and cycle_id:
                 self.audit.finish_cycle(
@@ -248,6 +266,49 @@ class TradingAgent:
             kept.append(candidate)
         return kept
 
+    async def _options_window(self) -> tuple[bool, dict]:
+        cfg = self.settings.execution
+        if not cfg.market_hours_only_options:
+            return True, {"note": "Option market-hours gate disabled."}
+        try:
+            clock = await self.broker.get_clock()
+        except Exception as exc:
+            # Fail closed for options: if we can't confirm the market is open with
+            # live quotes, do not price/trade options against stale marks.
+            return False, {"note": f"Clock unavailable; options blocked: {exc}"}
+        return self._evaluate_options_window(clock, datetime.now(UTC))
+
+    def _evaluate_options_window(self, clock: dict, now: datetime) -> tuple[bool, dict]:
+        cfg = self.settings.execution
+        info = {"is_open": bool(clock.get("is_open"))}
+        if not clock.get("is_open"):
+            info["note"] = "Options blocked: market is closed."
+            return False, info
+        eastern = now.astimezone(ZoneInfo("America/New_York"))
+        session_open = eastern.replace(hour=9, minute=30, second=0, microsecond=0)
+        if eastern < session_open + timedelta(minutes=cfg.open_buffer_minutes):
+            info["note"] = f"Options blocked: within {cfg.open_buffer_minutes}m of the open."
+            return False, info
+        next_close = clock.get("next_close")
+        if next_close:
+            try:
+                close_dt = datetime.fromisoformat(str(next_close).replace("Z", "+00:00"))
+                if now.astimezone(UTC) > close_dt - timedelta(minutes=cfg.close_buffer_minutes):
+                    info["note"] = f"Options blocked: within {cfg.close_buffer_minutes}m of the close."
+                    return False, info
+            except ValueError:
+                pass
+        info["note"] = "Options window open."
+        return True, info
+
+    def _option_spread_too_wide(self, bid: float | None, ask: float | None) -> bool:
+        if not bid or not ask or bid <= 0 or ask <= 0:
+            return True  # missing/zero quote is untrustworthy
+        mid = (bid + ask) / 2
+        if mid <= 0:
+            return True
+        return ((ask - bid) / mid) * 100 > self.settings.execution.max_option_spread_pct
+
     async def _market_regime_ok(self) -> tuple[bool, dict]:
         cfg = self.settings.regime
         if not cfg.enabled:
@@ -285,6 +346,7 @@ class TradingAgent:
         positions: list[Position],
         cycle_id: int | None = None,
         equity_entries_allowed: bool = True,
+        options_window_ok: bool = True,
     ) -> list[TradeCandidate]:
         candidates: list[TradeCandidate] = []
         screened = await self._screened_symbols(cycle_id)
@@ -364,6 +426,7 @@ class TradingAgent:
             candidates.extend(symbol_candidates)
             if (
                 self.settings.strategy.allow_options
+                and options_window_ok
                 and market.asset_class in {AssetClass.EQUITY, AssetClass.ETF}
             ):
                 option_candidates = await self._option_candidates(market, positions, candidates)
@@ -532,6 +595,7 @@ class TradingAgent:
         account,
         cycle_id: int | None,
         positions: list[Position] | None = None,
+        options_window_ok: bool = True,
     ) -> None:
         open_orders = await self._open_order_reservations()
         daily_counts = self._daily_order_counts()
@@ -562,6 +626,21 @@ class TradingAgent:
             if not is_exit and submitted_entries >= self.settings.agent.max_orders_per_cycle:
                 break
             if not decision.approved or not decision.intent:
+                continue
+            if decision.intent.asset_class == AssetClass.OPTION and not options_window_ok:
+                # Don't submit option entries OR exits outside the trustworthy
+                # options window (closed market / open auction). This stops bad
+                # after-hours fills and stop-loss whipsaws on open-auction marks.
+                self.console.print(f"[yellow]option order deferred[/yellow] {decision.intent.symbol}: outside options window")
+                self._audit_event(
+                    cycle_id,
+                    "order",
+                    {"intent": decision.intent},
+                    symbol=decision.intent.symbol,
+                    strategy=decision.candidate.strategy,
+                    status="skipped",
+                    reason="Outside the options trading window (market closed or open/close buffer).",
+                )
                 continue
             cap_reason = self._daily_cap_reason(
                 decision,
@@ -1640,6 +1719,10 @@ class TradingAgent:
         except Exception:
             return None
         bid, ask = self.broker.option_quote_bid_ask(quote)
+        # Reject untrustworthy quotes (missing, zero, or implausibly wide) so we
+        # never size or fill an option off a stale/garbage mark.
+        if self._option_spread_too_wide(bid, ask):
+            return None
         if preferred_side == "ask" and ask and ask > 0:
             return ask
         if preferred_side == "bid" and bid and bid > 0:
