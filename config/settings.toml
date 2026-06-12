@@ -70,15 +70,17 @@ max_option_spread_pct = 25.0
 
 [strategy]
 symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "BTC/USD", "ETH/USD"]
+# Premium-buying option strategies (long_call, long_put, call_debit_spread,
+# put_debit_spread) are disabled: 0 wins in 11 round trips across two paper
+# accounts (-$6,130 realized). They pay wide option quotes both ways and the
+# 40% premium stop turns quote noise into realized losses. The remaining
+# option strategies SELL premium, which sits on the profitable side of the
+# same wide quotes.
 enabled = [
   "equity_momentum",
   "crypto_momentum",
   "covered_call",
-  "cash_secured_put",
-  "long_call",
-  "long_put",
-  "call_debit_spread",
-  "put_debit_spread"
+  "cash_secured_put"
 ]
 allow_options = true
 allow_crypto = true
