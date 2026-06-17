@@ -133,10 +133,27 @@ class TradingAgent:
                 self._audit_candidate(cycle_id, candidate)
 
             day_trading_enabled = self.settings.day_trading.enabled
-            # Trustworthy options window (market open, past the open/close buffers).
-            # Gates option entry generation AND option order submission so options
-            # are never priced/traded on stale after-hours or open-auction marks.
-            options_window_ok, options_window_info = await self._options_window()
+            # Fetch market clock once per cycle: used for the equity market-open
+            # gate (no equity/option orders when market is closed — prevents
+            # weekend churn) and the options trading window (open/close buffers).
+            try:
+                _clock = await self.broker.get_clock()
+            except Exception:
+                _clock = None
+            market_open = bool(_clock and _clock.get("is_open"))
+
+            if self.settings.execution.market_hours_only_options:
+                if _clock is None:
+                    options_window_ok: bool = False
+                    options_window_info: dict = {"note": "Clock unavailable; options blocked."}
+                else:
+                    options_window_ok, options_window_info = self._evaluate_options_window(
+                        _clock, datetime.now(UTC)
+                    )
+            else:
+                options_window_ok, options_window_info = True, {
+                    "note": "Option market-hours gate disabled."
+                }
             self._audit_event(
                 cycle_id,
                 "options_window",
@@ -181,7 +198,9 @@ class TradingAgent:
 
             if self.settings.agent.execute_orders:
                 await self._submit_decisions(
-                    decisions, account, cycle_id, positions, options_window_ok=options_window_ok
+                    decisions, account, cycle_id, positions,
+                    options_window_ok=options_window_ok,
+                    market_open=market_open,
                 )
                 await self._sync_recent_order_updates(cycle_id)
             if self.audit and cycle_id:
@@ -596,6 +615,7 @@ class TradingAgent:
         cycle_id: int | None,
         positions: list[Position] | None = None,
         options_window_ok: bool = True,
+        market_open: bool = True,
     ) -> None:
         open_orders = await self._open_order_reservations()
         daily_counts = self._daily_order_counts()
@@ -640,6 +660,21 @@ class TradingAgent:
                     strategy=decision.candidate.strategy,
                     status="skipped",
                     reason="Outside the options trading window (market closed or open/close buffer).",
+                )
+                continue
+            if not market_open and decision.intent.asset_class != AssetClass.CRYPTO:
+                self.console.print(
+                    f"[yellow]order deferred[/yellow] {decision.intent.symbol}: "
+                    f"market closed — equity/option orders skipped"
+                )
+                self._audit_event(
+                    cycle_id,
+                    "order",
+                    {"intent": decision.intent},
+                    symbol=decision.intent.symbol,
+                    strategy=decision.candidate.strategy,
+                    status="skipped",
+                    reason="Market closed; only crypto orders are allowed.",
                 )
                 continue
             cap_reason = self._daily_cap_reason(

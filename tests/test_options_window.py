@@ -160,3 +160,45 @@ async def test_submit_allows_options_inside_window() -> None:
 
     await agent._submit_decisions([_option_buy()], account, None, options_window_ok=True)
     assert any(i.symbol == "MSFT260101C00400000" for i in agent.broker.submitted)
+
+
+# --- market-closed gate (weekend churn prevention) -------------------------
+
+def _crypto_buy() -> RiskDecision:
+    c = TradeCandidate(
+        symbol="BTC/USD", asset_class=AssetClass.CRYPTO, side=OrderSide.BUY,
+        strategy="crypto_momentum", score=80, entry_price=60000,
+    )
+    i = OrderIntent(
+        symbol="BTC/USD", asset_class=AssetClass.CRYPTO, side=OrderSide.BUY,
+        qty=0.1, order_type=OrderType.LIMIT, limit_price=60000,
+    )
+    return RiskDecision(approved=True, reason="ok", intent=i, candidate=c)
+
+
+@pytest.mark.anyio
+async def test_market_closed_blocks_equity_but_allows_crypto() -> None:
+    agent = _agent()
+    agent.broker = _FakeBroker()
+    account = AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000, last_equity=100_000)
+
+    await agent._submit_decisions(
+        [_equity_buy(), _crypto_buy()], account, None, market_open=False
+    )
+
+    submitted = {i.symbol for i in agent.broker.submitted}
+    assert "MSFT" not in submitted
+    assert "BTC/USD" in submitted
+
+
+@pytest.mark.anyio
+async def test_market_open_allows_equity() -> None:
+    agent = _agent()
+    agent.broker = _FakeBroker()
+    account = AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000, last_equity=100_000)
+
+    await agent._submit_decisions(
+        [_equity_buy()], account, None, market_open=True
+    )
+
+    assert any(i.symbol == "MSFT" for i in agent.broker.submitted)

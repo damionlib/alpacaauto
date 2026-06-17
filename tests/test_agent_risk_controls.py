@@ -52,6 +52,9 @@ class FakeBroker:
         self.cancel_all_called = True
         return []
 
+    async def get_clock(self):
+        return {"is_open": True, "next_close": "2026-01-01T20:00:00Z"}
+
     async def get_account(self):
         return self.account
 
