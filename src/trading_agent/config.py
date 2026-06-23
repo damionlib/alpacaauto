@@ -54,6 +54,7 @@ class PositionManagerConfig(BaseModel):
     take_profit_pct: float = Field(default=12.0, gt=0, le=500)
     trailing_stop_pct: float = Field(default=8.0, gt=0, le=100)
     max_holding_days: int = Field(default=20, ge=0)
+    max_days_without_profit: int = Field(default=7, ge=0)
     profit_lock_enabled: bool = True
     profit_lock_steps: list[ProfitLockStep] = Field(
         default_factory=lambda: [

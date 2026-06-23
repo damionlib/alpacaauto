@@ -72,8 +72,10 @@ class MomentumStrategy:
                 pullback_score = 18.0
             elif extension_pct <= 4.0:
                 pullback_score = 8.0
+            elif extension_pct <= 5.0:
+                pullback_score = -5.0
             elif extension_pct <= 8.0:
-                pullback_score = -8.0
+                pullback_score = -15.0
             else:
                 pullback_score = -20.0
             momentum_score = min(max(change20, 0) * 1.5, 22)

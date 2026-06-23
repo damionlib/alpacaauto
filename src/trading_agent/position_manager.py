@@ -381,6 +381,21 @@ class PositionManager:
                     ],
                 }
 
+        max_days_no_profit = self.settings.position_manager.max_days_without_profit
+        if max_days_no_profit and metrics["holding_days"] >= max_days_no_profit:
+            peak_price = float(metrics.get("peak_price") or 0)
+            if position.avg_entry_price and peak_price > 0:
+                peak_pnl_pct = ((peak_price - position.avg_entry_price) / position.avg_entry_price) * 100
+                if peak_pnl_pct < 0.5:
+                    return {
+                        "strategy": "stale_loser_exit",
+                        "score": 85,
+                        "rationale": [
+                            f"Position never meaningfully profitable (peak P/L {peak_pnl_pct:.2f}%) "
+                            f"after {metrics['holding_days']} days; cutting the dead weight."
+                        ],
+                    }
+
         max_holding_days = self.settings.position_manager.max_holding_days
         if max_holding_days and metrics["holding_days"] >= max_holding_days:
             return {

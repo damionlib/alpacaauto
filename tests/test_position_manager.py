@@ -151,6 +151,76 @@ def test_position_manager_creates_time_exit(tmp_path) -> None:
     assert candidates[0].strategy == "time_exit"
 
 
+def test_position_manager_creates_stale_loser_exit(tmp_path) -> None:
+    settings = Settings.model_validate(
+        {"position_manager": {"max_days_without_profit": 7}}
+    )
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    manager = PositionManager(settings, store)
+    old_date = (datetime.now(UTC) - timedelta(days=10)).isoformat()
+    with store._connect() as connection:
+        connection.execute(
+            """
+            insert into position_state
+                (symbol, asset_class, first_seen_at, last_seen_at, peak_price, trough_price)
+            values (?, ?, ?, ?, ?, ?)
+            """,
+            ("LLY", "equity", old_date, old_date, 100.3, 95),
+        )
+
+    candidates = manager.evaluate(
+        [
+            Position(
+                symbol="LLY",
+                asset_class=AssetClass.EQUITY,
+                qty=10,
+                market_value=9_700,
+                avg_entry_price=100,
+                current_price=97,
+                unrealized_pl=-30,
+            )
+        ]
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].strategy == "stale_loser_exit"
+
+
+def test_stale_loser_spares_position_that_was_profitable(tmp_path) -> None:
+    settings = Settings.model_validate(
+        {"position_manager": {"max_days_without_profit": 7}}
+    )
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    manager = PositionManager(settings, store)
+    old_date = (datetime.now(UTC) - timedelta(days=10)).isoformat()
+    with store._connect() as connection:
+        connection.execute(
+            """
+            insert into position_state
+                (symbol, asset_class, first_seen_at, last_seen_at, peak_price, trough_price)
+            values (?, ?, ?, ?, ?, ?)
+            """,
+            ("AAPL", "equity", old_date, old_date, 105, 98),
+        )
+
+    candidates = manager.evaluate(
+        [
+            Position(
+                symbol="AAPL",
+                asset_class=AssetClass.EQUITY,
+                qty=10,
+                market_value=9_900,
+                avg_entry_price=100,
+                current_price=99,
+                unrealized_pl=-10,
+            )
+        ]
+    )
+
+    stale = [c for c in candidates if c.strategy == "stale_loser_exit"]
+    assert len(stale) == 0
+
+
 def test_position_manager_creates_short_option_stop_loss_exit() -> None:
     manager = PositionManager(Settings())
 
