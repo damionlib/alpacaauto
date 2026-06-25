@@ -193,6 +193,8 @@ class CatalystEngine:
         )
 
     def _candidate_block_reason(self, candidate: TradeCandidate, prediction: CatalystPrediction) -> str | None:
+        if candidate.metadata.get("day_trade", False):
+            return None
         stance = self._strategy_stance(candidate.strategy)
         if prediction.block_reason and stance != "neutral_income":
             return f"Catalyst blocked entry: {prediction.block_reason}"

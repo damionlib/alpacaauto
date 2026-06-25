@@ -202,3 +202,39 @@ def test_catalyst_can_generate_spot_entry_candidate() -> None:
     assert candidate is not None
     assert candidate.strategy == "equity_catalyst"
     assert candidate.metadata["catalyst"]["direction"] == "bullish"
+
+
+def test_catalyst_block_reason_skips_day_trade_candidates() -> None:
+    engine = CatalystEngine(Settings())
+    prediction = engine.evaluate(
+        MarketSnapshot(
+            symbol="GE",
+            asset_class=AssetClass.EQUITY,
+            price=85,
+            closes=[100 - index * 0.2 for index in range(60)],
+        ),
+        ResearchSnapshot(
+            symbol="GE",
+            news=[
+                NewsItem(title="Rumor says GE may face tariff headwinds"),
+            ],
+        ),
+    )
+    assert prediction.block_reason is not None
+
+    swing = TradeCandidate(
+        symbol="GE", asset_class=AssetClass.EQUITY, side=OrderSide.BUY,
+        strategy="equity_momentum", score=80, entry_price=85,
+    )
+    day = TradeCandidate(
+        symbol="GE", asset_class=AssetClass.EQUITY, side=OrderSide.BUY,
+        strategy="day_trade_entry", score=82, entry_price=85,
+        metadata={"day_trade": True, "day_trade_entry": True},
+    )
+
+    accepted, blocked = engine.apply_to_candidates([swing, day], prediction)
+    blocked_symbols = {c.symbol for c, _ in blocked}
+    accepted_strategies = {c.strategy for c in accepted}
+
+    assert "GE" in blocked_symbols
+    assert "day_trade_entry" in accepted_strategies
