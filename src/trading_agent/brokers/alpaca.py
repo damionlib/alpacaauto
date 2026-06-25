@@ -400,6 +400,35 @@ class AlpacaBroker:
         except (TypeError, ValueError):
             return None
 
+    async def get_most_actives(self, top: int = 20) -> list[dict[str, Any]]:
+        data = await self._request(
+            "GET",
+            f"{DATA_API_BASE}/v1beta1/screener/stocks/most-actives",
+            params={"by": "volume", "top": top},
+        )
+        return data.get("most_actives", [])
+
+    async def get_movers(self, top: int = 10) -> dict[str, list[dict[str, Any]]]:
+        data = await self._request(
+            "GET",
+            f"{DATA_API_BASE}/v1beta1/screener/stocks/movers",
+            params={"top": top},
+        )
+        return {
+            "gainers": data.get("gainers", []),
+            "losers": data.get("losers", []),
+        }
+
+    async def get_snapshots_batch(
+        self, symbols: list[str], *, feed: str = "iex",
+    ) -> dict[str, dict[str, Any]]:
+        data = await self._request(
+            "GET",
+            f"{DATA_API_BASE}/v2/stocks/snapshots",
+            params={"symbols": ",".join(symbols), "feed": feed},
+        )
+        return data if isinstance(data, dict) else {}
+
     async def _get_stock_bars(self, symbols: list[str]) -> dict[str, tuple[list[float], list[float]]]:
         start = (datetime.now(UTC) - timedelta(days=100)).isoformat()
         data = await self._request(

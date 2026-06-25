@@ -24,18 +24,93 @@ class MarketScreener:
         self.settings = settings
         self.broker = broker
 
+    async def day_trade_symbols(self) -> list[str]:
+        getter = getattr(self.broker, "get_most_actives", None)
+        if not getter:
+            return []
+        try:
+            actives = await getter(20)
+        except Exception:
+            actives = []
+        mover_getter = getattr(self.broker, "get_movers", None)
+        movers: list[dict] = []
+        if mover_getter:
+            try:
+                data = await mover_getter(10)
+                movers = data.get("gainers", [])
+            except Exception:
+                pass
+        seen: set[str] = set()
+        symbols: list[str] = []
+        for item in actives:
+            sym = item.get("symbol", "")
+            if sym and sym not in seen:
+                seen.add(sym)
+                symbols.append(sym)
+        for item in movers:
+            sym = item.get("symbol", "")
+            if sym and sym not in seen and item.get("price", 0) >= self.settings.screener.min_price:
+                seen.add(sym)
+                symbols.append(sym)
+        return symbols
+
     async def top_symbols(self) -> list[ScreenedSymbol]:
         if not self.settings.screener.enabled:
             return []
 
         raw_symbols = symbols_for_universes(self.settings.screener.universes)
+        if self.settings.day_trading.enabled:
+            live_symbols = await self.day_trade_symbols()
+            for sym in live_symbols:
+                if sym not in raw_symbols:
+                    raw_symbols.append(sym)
         if not self.settings.strategy.allow_crypto:
             raw_symbols = [symbol for symbol in raw_symbols if "/" not in symbol]
-        tasks = [self._screen_symbol(symbol) for symbol in raw_symbols]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        equity_symbols = [s for s in raw_symbols if "/" not in s]
+        crypto_symbols = [s for s in raw_symbols if "/" in s]
 
+        batch_getter = getattr(self.broker, "get_snapshots_batch", None)
         candidates: list[ScreenedSymbol] = []
-        for result in results:
+
+        if batch_getter and equity_symbols:
+            for chunk_start in range(0, len(equity_symbols), 50):
+                chunk = equity_symbols[chunk_start : chunk_start + 50]
+                try:
+                    snapshots = await batch_getter(chunk)
+                except Exception:
+                    snapshots = {}
+                bar_data = await self._get_bars_for_symbols(chunk)
+                for sym in chunk:
+                    snap_data = snapshots.get(sym)
+                    bars = bar_data.get(sym)
+                    if not bars:
+                        continue
+                    closes, volumes = bars
+                    if not closes:
+                        continue
+                    price = closes[-1]
+                    if snap_data:
+                        trade = snap_data.get("latestTrade", {})
+                        if trade.get("p"):
+                            price = float(trade["p"])
+                    snapshot = MarketSnapshot(
+                        symbol=sym, asset_class=AssetClass.EQUITY,
+                        price=price, closes=closes,
+                        metadata={"volumes": volumes},
+                    )
+                    scored = self.score_snapshot(snapshot)
+                    if scored:
+                        candidates.append(scored)
+        else:
+            tasks = [self._screen_symbol(symbol) for symbol in equity_symbols]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, ScreenedSymbol):
+                    candidates.append(result)
+
+        crypto_tasks = [self._screen_symbol(symbol) for symbol in crypto_symbols]
+        crypto_results = await asyncio.gather(*crypto_tasks, return_exceptions=True)
+        for result in crypto_results:
             if isinstance(result, ScreenedSymbol):
                 candidates.append(result)
 
@@ -55,6 +130,15 @@ class MarketScreener:
             *sorted(crypto_candidates, key=lambda item: item.score, reverse=True)[: self.settings.screener.max_crypto_candidates],
         ]
         return sorted(selected, key=lambda item: item.score, reverse=True)[: self.settings.screener.max_candidates]
+
+    async def _get_bars_for_symbols(self, symbols: list[str]) -> dict[str, tuple[list[float], list[float]]]:
+        getter = getattr(self.broker, "_get_stock_bars", None)
+        if not getter:
+            return {}
+        try:
+            return await getter(symbols)
+        except Exception:
+            return {}
 
     async def _screen_symbol(self, symbol: str) -> ScreenedSymbol | None:
         try:

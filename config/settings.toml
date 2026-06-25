@@ -15,7 +15,7 @@ live_max_total_orders_per_day = 6
 
 [audit]
 enabled = true
-database_path = "data/trading_agent_paper_clean_20260606.sqlite3"
+database_path = "data/trading_agent_paper_clean_20260624.sqlite3"
 
 [position_manager]
 enabled = true
@@ -78,10 +78,6 @@ symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "BTC/USD", "ETH/USD"]
 # option strategies SELL premium, which sits on the profitable side of the
 # same wide quotes.
 enabled = [
-  "equity_momentum",
-  "crypto_momentum",
-  "covered_call",
-  "cash_secured_put"
 ]
 allow_options = true
 allow_crypto = true
@@ -106,14 +102,14 @@ min_trade_score = 65.0
 min_entry_score = 80.0
 score_weight = 0.35
 max_volatility_pct = 75.0
-generate_entry_candidates = true
+generate_entry_candidates = false
 block_low_confidence = true
 block_rumor_only = true
 block_high_event_risk = true
 require_medium_confidence_for_options = true
 
 [day_trading]
-enabled = false
+enabled = true
 paper_only = true
 max_trades_per_day = 3
 risk_per_trade_pct = 0.25
@@ -123,13 +119,13 @@ max_position_minutes = 120
 force_exit_before_close_minutes = 15
 min_catalyst_score = 65.0
 min_intraday_score = 70.0
-min_combined_score = 80.0
+min_combined_score = 75.0
 exit_intraday_score = 45.0
 stop_loss_pct = 1.0
 take_profit_pct = 2.0
 trailing_stop_pct = 1.0
 min_relative_volume = 1.2
-max_spread_pct = 0.25
+max_spread_pct = 1.5
 
 [research]
 news_headline_limit = 8
