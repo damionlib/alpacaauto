@@ -124,6 +124,10 @@ exit_intraday_score = 45.0
 stop_loss_pct = 1.0
 take_profit_pct = 2.0
 trailing_stop_pct = 1.0
+profit_protect_pct = 0.4
+profit_trail_pct = 0.5
+stale_negative_minutes = 30
+time_decay_minutes = 60
 min_relative_volume = 1.2
 max_spread_pct = 1.5
 

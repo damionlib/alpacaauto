@@ -12,6 +12,7 @@ from trading_agent.models import AssetClass, MarketSnapshot, OrderSide, Position
 class DayTradingEngine:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._peak_pnl: dict[str, float] = {}
 
     def enabled(self) -> bool:
         if not self.settings.day_trading.enabled:
@@ -116,19 +117,25 @@ class DayTradingEngine:
 
         pnl_pct = ((current_price - position.avg_entry_price) / position.avg_entry_price) * 100
         held_minutes = self._held_minutes(entry_event, now=now)
+        prev_peak = self._peak_pnl.get(position.symbol, 0.0)
+        peak_pnl_pct = max(prev_peak, pnl_pct)
+        self._peak_pnl[position.symbol] = peak_pnl_pct
         exit_reason, exit_score = self._exit_reason(
             pnl_pct=pnl_pct,
             held_minutes=held_minutes,
             prediction=prediction,
             intraday_score=float(signal["intraday_score"]),
             now=now,
+            peak_pnl_pct=peak_pnl_pct,
         )
         signal["pnl_pct"] = round(pnl_pct, 4)
+        signal["peak_pnl_pct"] = round(peak_pnl_pct, 4)
         signal["held_minutes"] = held_minutes
         if not exit_reason:
             return None, signal
 
         signal.update({"status": "generated", "reason": exit_reason})
+        self._peak_pnl.pop(position.symbol, None)
         candidate = TradeCandidate(
             symbol=position.symbol,
             asset_class=position.asset_class,
@@ -289,20 +296,58 @@ class DayTradingEngine:
         prediction: CatalystPrediction,
         intraday_score: float,
         now: datetime | None,
+        peak_pnl_pct: float = 0.0,
     ) -> tuple[str | None, float]:
         cfg = self.settings.day_trading
         if pnl_pct <= -cfg.stop_loss_pct:
             return f"Day-trade stop loss hit at {pnl_pct:.2f}%.", 100
-        if pnl_pct >= cfg.take_profit_pct:
-            return f"Day-trade take profit hit at {pnl_pct:.2f}%.", 96
-        if prediction.direction == "bearish" and prediction.prediction_score >= cfg.min_catalyst_score:
-            return "Catalyst flipped bearish for the day-trade position.", 94
-        if intraday_score <= cfg.exit_intraday_score:
-            return "Intraday trend score fell below exit threshold.", 88
-        if held_minutes is not None and held_minutes >= cfg.max_position_minutes:
-            return "Day-trade maximum holding time reached.", 84
         if self._force_exit_window(now=now):
             return "Approaching market close; day-trade positions must not be held overnight.", 98
+        if pnl_pct >= cfg.take_profit_pct:
+            return f"Day-trade take profit hit at {pnl_pct:.2f}%.", 96
+        if peak_pnl_pct >= cfg.profit_protect_pct:
+            floor = peak_pnl_pct - cfg.profit_trail_pct
+            if pnl_pct <= floor:
+                return (
+                    f"Trailing stop: P/L fell to {pnl_pct:.2f}% from peak "
+                    f"{peak_pnl_pct:.2f}% (floor {floor:.2f}%).",
+                    95,
+                )
+        if prediction.direction == "bearish" and prediction.prediction_score >= cfg.min_catalyst_score:
+            return "Catalyst flipped bearish for the day-trade position.", 94
+        if peak_pnl_pct >= 0.3 and pnl_pct <= 0.0:
+            return (
+                f"Profit reversal: peaked at +{peak_pnl_pct:.2f}% but now {pnl_pct:.2f}%.",
+                92,
+            )
+        if intraday_score <= cfg.exit_intraday_score:
+            return "Intraday trend score fell below exit threshold.", 88
+        if (
+            held_minutes is not None
+            and cfg.stale_negative_minutes > 0
+            and held_minutes >= cfg.stale_negative_minutes
+            and peak_pnl_pct < 0.2
+        ):
+            return (
+                f"Stale negative: held {held_minutes} min, peak P/L only "
+                f"{peak_pnl_pct:.2f}%.",
+                86,
+            )
+        if held_minutes is not None and cfg.time_decay_minutes > 0:
+            if held_minutes >= 90 and pnl_pct < 0.5:
+                return (
+                    f"Time decay: {pnl_pct:.2f}% P/L after {held_minutes} min "
+                    f"(need >= 0.5%).",
+                    85,
+                )
+            if held_minutes >= cfg.time_decay_minutes and pnl_pct < 0.3:
+                return (
+                    f"Time decay: {pnl_pct:.2f}% P/L after {held_minutes} min "
+                    f"(need >= 0.3%).",
+                    83,
+                )
+        if held_minutes is not None and held_minutes >= cfg.max_position_minutes:
+            return "Day-trade maximum holding time reached.", 84
         return None, 0
 
     def _news_risks(self, research: ResearchSnapshot) -> list[str]:

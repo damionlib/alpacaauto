@@ -156,6 +156,10 @@ class DayTradingConfig(BaseModel):
     stop_loss_pct: float = Field(default=1.0, gt=0, le=10)
     take_profit_pct: float = Field(default=2.0, gt=0, le=20)
     trailing_stop_pct: float = Field(default=1.0, gt=0, le=10)
+    profit_protect_pct: float = Field(default=0.4, ge=0, le=10)
+    profit_trail_pct: float = Field(default=0.5, ge=0, le=10)
+    stale_negative_minutes: int = Field(default=30, ge=0)
+    time_decay_minutes: int = Field(default=60, ge=0)
     min_relative_volume: float = Field(default=1.2, ge=0)
     max_spread_pct: float = Field(default=0.25, gt=0, le=5)
 
