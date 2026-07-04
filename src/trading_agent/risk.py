@@ -151,8 +151,15 @@ class RiskEngine:
         positions: list[Position],
         available_cash: float,
     ) -> RiskDecision:
+        setup_multiplier = 1.0
         if candidate.metadata.get("day_trade"):
-            max_position_pct = self.settings.day_trading.max_position_pct
+            setup = str(candidate.metadata.get("setup") or "")
+            setup_multiplier = float(
+                self.settings.day_trading.setup_risk_multipliers.get(setup, 1.0)
+            )
+            # Scale the position cap too: day trades are cap-bound, so scaling only
+            # the risk budget would not actually shrink the order.
+            max_position_pct = self.settings.day_trading.max_position_pct * setup_multiplier
         else:
             max_position_pct = (
                 self.settings.risk.max_crypto_position_pct
@@ -166,7 +173,7 @@ class RiskEngine:
             return self._reject(candidate, "Position cap already reached.")
 
         risk_per_trade_pct = (
-            self.settings.day_trading.risk_per_trade_pct
+            self.settings.day_trading.risk_per_trade_pct * setup_multiplier
             if candidate.metadata.get("day_trade")
             else self.settings.risk.max_risk_per_trade_pct
         )

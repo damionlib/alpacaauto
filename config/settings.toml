@@ -26,6 +26,7 @@ max_holding_days = 20
 max_days_without_profit = 7
 profit_lock_enabled = true
 profit_lock_steps = [
+  { profit_pct = 2.0, lock_pct = 0.75 },
   { profit_pct = 3.0, lock_pct = 2.0 },
   { profit_pct = 5.0, lock_pct = 3.5 },
   { profit_pct = 7.0, lock_pct = 5.5 }
@@ -113,23 +114,40 @@ enabled = true
 paper_only = true
 max_trades_per_day = 3
 risk_per_trade_pct = 0.25
-max_position_pct = 4.0
+# Position cap raised 4 -> 8: sizing is cap-bound, so actual per-trade dollar risk
+# was only ~13% of the risk_per_trade budget. Still cap-bound at 8%.
+max_position_pct = 8.0
 max_daily_loss_pct = 1.0
-max_position_minutes = 120
+max_position_minutes = 480
 force_exit_before_close_minutes = 15
 min_catalyst_score = 65.0
 min_intraday_score = 70.0
 min_combined_score = 75.0
 exit_intraday_score = 45.0
-stop_loss_pct = 1.0
-take_profit_pct = 2.0
+# stop/take_profit are caps on the ADR-derived floor/ceiling. Raised so the caps
+# only bind on genuinely high-ADR names (a 1.0% floor on a 5% ADR stock is a
+# noise-stop at 0.2 ADR).
+stop_loss_pct = 1.5
+take_profit_pct = 3.0
 trailing_stop_pct = 1.0
-profit_protect_pct = 0.4
-profit_trail_pct = 0.5
-stale_negative_minutes = 30
-time_decay_minutes = 60
+ceiling_adr_fraction = 0.55
+floor_adr_fraction = 0.40
+# Partial scale-out: bank half at 0.45xADR (max 1.0%), rest runs to the ceiling
+# behind a breakeven stop. Targets the observed +0.8-1.0% peak-then-fade pattern.
+partial_exit_adr_fraction = 0.45
+partial_exit_max_pct = 1.0
+partial_exit_size = 0.5
+profit_protect_pct = 0
+profit_trail_pct = 0
+stale_negative_minutes = 0
+time_decay_minutes = 0
 min_relative_volume = 1.2
 max_spread_pct = 1.5
+
+# Setups with weak realized expectancy trade at reduced size until proven
+# (opening_range_break: 33% win rate, ~$0 net over 9 trades as of Jul 2026).
+[day_trading.setup_risk_multipliers]
+opening_range_break = 0.5
 
 [research]
 news_headline_limit = 8

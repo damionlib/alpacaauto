@@ -51,6 +51,10 @@ class AlpacaBroker:
                 details = self._error_details(response)
                 raise RuntimeError(f"{method} {url} failed with {response.status_code}: {details}")
             response.raise_for_status()
+            # Alpaca returns 204 No Content for DELETE (cancel order); parsing
+            # the empty body as JSON would raise even though the call succeeded.
+            if response.status_code == 204 or not response.content:
+                return None
             return response.json()
 
     def _error_details(self, response: httpx.Response) -> str:
@@ -399,6 +403,32 @@ class AlpacaBroker:
             return float(value) if value not in (None, "") else None
         except (TypeError, ValueError):
             return None
+
+    async def get_daily_adr(self, symbol: str, days: int = 20) -> float | None:
+        start = (datetime.now(UTC) - timedelta(days=days * 3)).isoformat()
+        data = await self._request(
+            "GET",
+            f"{DATA_API_BASE}/v2/stocks/bars",
+            params={
+                "symbols": symbol,
+                "timeframe": "1Day",
+                "start": start,
+                "feed": "iex",
+                "limit": days + 5,
+            },
+        )
+        bars = data.get("bars", {}).get(symbol, [])
+        if not bars:
+            return None
+        recent = bars[-days:]
+        ranges = []
+        for bar in recent:
+            o = self._coerce_float(bar.get("o"))
+            h = self._coerce_float(bar.get("h"))
+            l = self._coerce_float(bar.get("l"))
+            if o and h and l and o > 0:
+                ranges.append(((h - l) / o) * 100)
+        return sum(ranges) / len(ranges) if ranges else None
 
     async def get_most_actives(self, top: int = 20) -> list[dict[str, Any]]:
         data = await self._request(

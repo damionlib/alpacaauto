@@ -62,9 +62,25 @@ class DayTradingEngine:
             return None, signal
 
         cfg = self.settings.day_trading
-        stop_price = market.price * (1 - cfg.stop_loss_pct / 100)
-        take_profit = market.price * (1 + cfg.take_profit_pct / 100)
-        signal.update({"status": "generated", "reason": "Day-trade entry setup passed all signal gates."})
+        adr_pct = self._float((market.metadata or {}).get("adr_pct"))
+        if adr_pct and adr_pct > 0:
+            ceiling_pct = round(min(adr_pct * cfg.ceiling_adr_fraction, cfg.take_profit_pct), 4)
+            floor_pct = round(min(adr_pct * cfg.floor_adr_fraction, cfg.stop_loss_pct), 4)
+            partial_pct = round(min(adr_pct * cfg.partial_exit_adr_fraction, cfg.partial_exit_max_pct), 4)
+        else:
+            ceiling_pct = cfg.take_profit_pct
+            floor_pct = cfg.stop_loss_pct
+            partial_pct = cfg.partial_exit_max_pct
+        stop_price = market.price * (1 - floor_pct / 100)
+        take_profit = market.price * (1 + ceiling_pct / 100)
+        signal.update({
+            "status": "generated",
+            "reason": "Day-trade entry setup passed all signal gates.",
+            "adr_pct": adr_pct,
+            "ceiling_pct": ceiling_pct,
+            "floor_pct": floor_pct,
+            "partial_pct": partial_pct,
+        })
         candidate = TradeCandidate(
             symbol=market.symbol,
             asset_class=market.asset_class,
@@ -77,13 +93,19 @@ class DayTradingEngine:
             rationale=[
                 f"Day trade setup {signal['setup']} scored {signal['combined_score']:.2f}.",
                 f"Catalyst {prediction.direction} score {prediction.prediction_score:.2f}.",
-                *signal["evidence"][:4],
+                f"ADR {adr_pct:.2f}% → ceiling +{ceiling_pct:.2f}%, floor -{floor_pct:.2f}%."
+                if adr_pct else f"No ADR; using defaults +{ceiling_pct:.2f}%/-{floor_pct:.2f}%.",
+                *signal["evidence"][:3],
             ],
             metadata={
                 "day_trade": True,
                 "day_trade_entry": True,
                 "setup": signal["setup"],
                 "signal": signal,
+                "adr_pct": adr_pct,
+                "ceiling_pct": ceiling_pct,
+                "floor_pct": floor_pct,
+                "partial_pct": partial_pct,
                 "catalyst": prediction.model_dump(mode="json"),
             },
         )
@@ -120,6 +142,15 @@ class DayTradingEngine:
         prev_peak = self._peak_pnl.get(position.symbol, 0.0)
         peak_pnl_pct = max(prev_peak, pnl_pct)
         self._peak_pnl[position.symbol] = peak_pnl_pct
+        entry_meta = self._entry_metadata(entry_event)
+        cfg = self.settings.day_trading
+        ceiling_pct = self._float(entry_meta.get("ceiling_pct")) or cfg.take_profit_pct
+        floor_pct = self._float(entry_meta.get("floor_pct")) or cfg.stop_loss_pct
+        partial_pct = self._float(entry_meta.get("partial_pct")) or cfg.partial_exit_max_pct
+        # A position smaller than the entry order means the partial scale-out already
+        # banked its half; the remainder runs to the ceiling behind a breakeven stop.
+        entry_qty = self._entry_qty(entry_event)
+        partial_done = entry_qty is not None and position.qty < entry_qty - 1e-9
         exit_reason, exit_score = self._exit_reason(
             pnl_pct=pnl_pct,
             held_minutes=held_minutes,
@@ -127,11 +158,28 @@ class DayTradingEngine:
             intraday_score=float(signal["intraday_score"]),
             now=now,
             peak_pnl_pct=peak_pnl_pct,
+            ceiling_pct=ceiling_pct,
+            floor_pct=floor_pct,
+            breakeven_floor=partial_done,
         )
         signal["pnl_pct"] = round(pnl_pct, 4)
         signal["peak_pnl_pct"] = round(peak_pnl_pct, 4)
         signal["held_minutes"] = held_minutes
+        signal["partial_done"] = partial_done
         if not exit_reason:
+            partial_candidate = self._partial_exit_candidate(
+                position=position,
+                current_price=current_price,
+                pnl_pct=pnl_pct,
+                partial_pct=partial_pct,
+                ceiling_pct=ceiling_pct,
+                partial_done=partial_done,
+                prediction=prediction,
+                signal=signal,
+                entry_event=entry_event,
+            )
+            if partial_candidate is not None:
+                return partial_candidate, signal
             return None, signal
 
         signal.update({"status": "generated", "reason": exit_reason})
@@ -297,25 +345,43 @@ class DayTradingEngine:
         intraday_score: float,
         now: datetime | None,
         peak_pnl_pct: float = 0.0,
+        ceiling_pct: float | None = None,
+        floor_pct: float | None = None,
+        breakeven_floor: bool = False,
     ) -> tuple[str | None, float]:
         cfg = self.settings.day_trading
+        effective_floor = floor_pct or cfg.stop_loss_pct
+        effective_ceiling = ceiling_pct or cfg.take_profit_pct
+        if breakeven_floor and pnl_pct <= 0:
+            return (
+                f"Breakeven stop on the remainder after partial profit-take ({pnl_pct:.2f}%).",
+                100,
+            )
+        if pnl_pct <= -effective_floor:
+            return (
+                f"ADR floor stop hit at {pnl_pct:.2f}% (floor -{effective_floor:.2f}%).",
+                100,
+            )
         if pnl_pct <= -cfg.stop_loss_pct:
-            return f"Day-trade stop loss hit at {pnl_pct:.2f}%.", 100
+            return f"Hard stop loss hit at {pnl_pct:.2f}%.", 100
         if self._force_exit_window(now=now):
             return "Approaching market close; day-trade positions must not be held overnight.", 98
-        if pnl_pct >= cfg.take_profit_pct:
-            return f"Day-trade take profit hit at {pnl_pct:.2f}%.", 96
-        if peak_pnl_pct >= cfg.profit_protect_pct:
-            floor = peak_pnl_pct - cfg.profit_trail_pct
-            if pnl_pct <= floor:
-                return (
-                    f"Trailing stop: P/L fell to {pnl_pct:.2f}% from peak "
-                    f"{peak_pnl_pct:.2f}% (floor {floor:.2f}%).",
-                    95,
-                )
+        if pnl_pct >= effective_ceiling:
+            return (
+                f"ADR ceiling target hit at +{pnl_pct:.2f}% (target +{effective_ceiling:.2f}%).",
+                96,
+            )
         if prediction.direction == "bearish" and prediction.prediction_score >= cfg.min_catalyst_score:
             return "Catalyst flipped bearish for the day-trade position.", 94
-        if peak_pnl_pct >= 0.3 and pnl_pct <= 0.0:
+        if cfg.profit_protect_pct and peak_pnl_pct >= cfg.profit_protect_pct:
+            trail_floor = peak_pnl_pct - cfg.profit_trail_pct
+            if cfg.profit_trail_pct and pnl_pct <= trail_floor:
+                return (
+                    f"Trailing stop: P/L fell to {pnl_pct:.2f}% from peak "
+                    f"{peak_pnl_pct:.2f}% (floor {trail_floor:.2f}%).",
+                    95,
+                )
+        if peak_pnl_pct >= 0.3 and pnl_pct <= 0.0 and cfg.profit_protect_pct:
             return (
                 f"Profit reversal: peaked at +{peak_pnl_pct:.2f}% but now {pnl_pct:.2f}%.",
                 92,
@@ -396,6 +462,82 @@ class DayTradingEngine:
             if position.symbol == symbol and position.qty != 0:
                 return position
         return None
+
+    def _partial_exit_candidate(
+        self,
+        *,
+        position: Position,
+        current_price: float,
+        pnl_pct: float,
+        partial_pct: float,
+        ceiling_pct: float,
+        partial_done: bool,
+        prediction: CatalystPrediction,
+        signal: dict,
+        entry_event: dict | None,
+    ) -> TradeCandidate | None:
+        cfg = self.settings.day_trading
+        if partial_done or cfg.partial_exit_size <= 0 or partial_pct <= 0:
+            return None
+        if pnl_pct < partial_pct or position.qty < 2:
+            return None
+        sell_qty = max(1, int(position.qty * cfg.partial_exit_size))
+        remainder_qty = int(position.qty) - sell_qty
+        if remainder_qty < 1:
+            return None
+        entry_price = position.avg_entry_price or current_price
+        reason = (
+            f"Partial profit-take: +{pnl_pct:.2f}% reached partial target "
+            f"+{partial_pct:.2f}%; selling {sell_qty} of {int(position.qty)}, "
+            f"remainder runs to +{ceiling_pct:.2f}% behind a breakeven stop."
+        )
+        signal.update({"status": "generated", "reason": reason})
+        return TradeCandidate(
+            symbol=position.symbol,
+            asset_class=position.asset_class,
+            side=OrderSide.SELL,
+            strategy="day_trade_exit",
+            score=90,
+            entry_price=current_price,
+            rationale=[
+                reason,
+                f"Intraday score is {signal['intraday_score']:.2f}; catalyst direction is {prediction.direction}.",
+            ],
+            metadata={
+                "exit": True,
+                "exit_qty": sell_qty,
+                "partial_exit": True,
+                "remainder_qty": remainder_qty,
+                "remainder_stop_price": round(entry_price, 2),
+                "remainder_take_profit_price": round(entry_price * (1 + ceiling_pct / 100), 2),
+                "day_trade": True,
+                "day_trade_exit": True,
+                "signal": signal,
+                "entry_event_id": entry_event.get("id") if entry_event else None,
+                "position": position.model_dump(mode="json"),
+                "catalyst": prediction.model_dump(mode="json"),
+            },
+        )
+
+    @staticmethod
+    def _entry_qty(entry_event: dict | None) -> float | None:
+        if not entry_event:
+            return None
+        payload = entry_event.get("payload") or {}
+        intent = payload.get("intent") or {}
+        try:
+            qty = float(intent.get("qty"))
+        except (TypeError, ValueError):
+            return None
+        return qty if qty > 0 else None
+
+    @staticmethod
+    def _entry_metadata(entry_event: dict | None) -> dict:
+        if not entry_event:
+            return {}
+        payload = entry_event.get("payload") or {}
+        intent = payload.get("intent") or {}
+        return intent.get("metadata") or {}
 
     def _float(self, value) -> float | None:
         try:

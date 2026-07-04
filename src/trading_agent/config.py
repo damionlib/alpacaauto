@@ -100,7 +100,13 @@ class RiskConfig(BaseModel):
             [
                 "NVDA", "AVGO", "AMD", "MU", "AMAT", "LRCX", "KLAC", "ASML", "MRVL",
                 "TSM", "SMCI", "ORCL", "MSFT", "GOOGL", "GOOG", "META", "AAPL", "AMZN", "TSLA",
-            ]
+            ],
+            # Cybersecurity / high-beta software: the Jun 9 cluster loss (AAPL+PANW+CRWD
+            # gapping down together) was invisible to the cap because only AAPL was grouped.
+            [
+                "PANW", "CRWD", "ZS", "FTNT", "NET", "OKTA", "S", "DDOG",
+                "NOW", "CRM", "ADBE", "SNOW", "MDB", "TEAM", "WDAY",
+            ],
         ]
     )
 
@@ -156,6 +162,19 @@ class DayTradingConfig(BaseModel):
     stop_loss_pct: float = Field(default=1.0, gt=0, le=10)
     take_profit_pct: float = Field(default=2.0, gt=0, le=20)
     trailing_stop_pct: float = Field(default=1.0, gt=0, le=10)
+    ceiling_adr_fraction: float = Field(default=0.55, gt=0, le=2.0)
+    floor_adr_fraction: float = Field(default=0.40, gt=0, le=2.0)
+    # Partial scale-out: bank a fraction of the position at partial_exit_adr_fraction
+    # of ADR (capped at partial_exit_max_pct), then hold the rest to the ceiling with
+    # a breakeven stop. partial_exit_size=0 disables.
+    partial_exit_adr_fraction: float = Field(default=0.45, ge=0, le=2.0)
+    partial_exit_max_pct: float = Field(default=1.0, gt=0, le=10)
+    partial_exit_size: float = Field(default=0.5, ge=0, lt=1)
+    # Per-setup risk scaling (applies to both risk budget and position cap). Setups
+    # with weak realized expectancy trade smaller until they prove themselves.
+    setup_risk_multipliers: dict[str, float] = Field(
+        default_factory=lambda: {"opening_range_break": 0.5}
+    )
     profit_protect_pct: float = Field(default=0.4, ge=0, le=10)
     profit_trail_pct: float = Field(default=0.5, ge=0, le=10)
     stale_negative_minutes: int = Field(default=30, ge=0)

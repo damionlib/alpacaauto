@@ -18,6 +18,13 @@ from trading_agent.position_manager import PositionManager
 from trading_agent.risk import RiskEngine
 
 
+@pytest.fixture(autouse=True)
+def _fast_exit_retry(monkeypatch):
+    # The exit-retry loop sleeps between attempts to let broker-side cancels
+    # settle; tests should not pay that wall-clock cost.
+    monkeypatch.setattr("trading_agent.agent._EXIT_RETRY_DELAY_SECONDS", 0)
+
+
 class SilentConsole:
     def print(self, *args, **kwargs) -> None:  # noqa: D401 - test stub
         return None
@@ -609,7 +616,7 @@ async def test_exit_retry_failure_rearms_crypto_protective_stop() -> None:
     }
     broker = ScriptedBroker(
         open_orders=[protective],
-        submit_outcomes=[_CONFLICT, _CONFLICT],  # exit fails, retry fails too
+        submit_outcomes=[_CONFLICT] * 4,  # exit fails, all retries fail too
     )
     agent = _agent(broker)
     account = AccountSnapshot(equity=100_000, cash=100_000, buying_power=100_000, last_equity=100_000)
@@ -618,7 +625,12 @@ async def test_exit_retry_failure_rearms_crypto_protective_stop() -> None:
 
     # The protective stop was canceled for the retry, then restored after it failed.
     assert broker.canceled == ["p1"]
-    assert broker.calls == ["submit-fail:BTC/USD", "cancel:p1", "submit-fail:BTC/USD", "submit:BTC/USD"]
+    assert broker.calls == [
+        "submit-fail:BTC/USD",
+        "cancel:p1",
+        *["submit-fail:BTC/USD"] * 3,
+        "submit:BTC/USD",
+    ]
     assert len(broker.submitted) == 1
     restored = broker.submitted[0]
     assert restored.order_type == OrderType.STOP_LIMIT
@@ -647,7 +659,7 @@ async def test_exit_retry_failure_rearms_equity_bracket_as_oco() -> None:
     }
     broker = ScriptedBroker(
         open_orders=[stop_leg, take_profit_leg],
-        submit_outcomes=[_CONFLICT, _CONFLICT],  # exit fails, retry fails too
+        submit_outcomes=[_CONFLICT] * 4,  # exit fails, all retries fail too
     )
     agent = _agent(broker)
     account = AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000, last_equity=100_000)
@@ -680,7 +692,7 @@ async def test_exit_retry_does_not_rearm_unfilled_entry_order() -> None:
     }
     broker = ScriptedBroker(
         open_orders=[entry_order],
-        submit_outcomes=[_CONFLICT, _CONFLICT],
+        submit_outcomes=[_CONFLICT] * 4,
     )
     agent = _agent(broker)
     account = AccountSnapshot(equity=100_000, cash=50_000, buying_power=50_000, last_equity=100_000)

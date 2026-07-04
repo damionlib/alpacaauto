@@ -42,6 +42,12 @@ from trading_agent.strategies.options import OptionsStrategy
 # protection. We deliberately match on message text, not Alpaca numeric codes:
 # code 40310000 is a generic 403 reused for unrelated cases like "account not
 # eligible to trade options", so it is not a reliable conflict signal.
+# Broker order cancellation is asynchronous: the DELETE returns before the held
+# shares are released, so an exit resubmitted immediately after clearing the
+# conflicting orders can hit the same qty conflict again.
+_EXIT_RETRY_ATTEMPTS = 3
+_EXIT_RETRY_DELAY_SECONDS = 1.5
+
 _CONFLICT_ERROR_SIGNALS = (
     "insufficient qty",
     "insufficient balance",
@@ -245,6 +251,17 @@ class TradingAgent:
             return
         if features:
             market.metadata.update(features)
+        adr_getter = getattr(self.broker, "get_daily_adr", None)
+        if adr_getter and "adr_pct" not in market.metadata:
+            try:
+                adr = await adr_getter(market.symbol)
+            except Exception as exc:
+                adr = None
+                self.console.print(
+                    f"[yellow]ADR unavailable for {market.symbol}; falling back to fixed targets[/yellow] {exc}"
+                )
+            if adr is not None:
+                market.metadata["adr_pct"] = round(adr, 4)
 
     def _day_trade_symbols_today(self) -> set[str]:
         if not self.audit or not self.settings.day_trading.enabled:
@@ -772,6 +789,8 @@ class TradingAgent:
                 continue
             if is_exit:
                 await self._cancel_conflicting_open_orders(decision, open_orders, cycle_id)
+                if decision.candidate.metadata.get("partial_exit"):
+                    await self._place_partial_remainder_protection(decision, cycle_id)
             remaining_cash = max(remaining_cash - cash_required, 0.0)
             if not is_exit:
                 submitted_entries += 1
@@ -884,15 +903,23 @@ class TradingAgent:
         canceled = await self._cancel_conflicting_open_orders(decision, open_orders, cycle_id)
         if not canceled:
             return None, original_exc
-        try:
-            order = await self.broker.submit_order(decision.intent)
-        except Exception as retry_exc:
-            # The exit still failed after we cleared protection. Put the canceled
-            # orders back so the position is not left unguarded; the position
-            # manager will attempt the exit again next cycle.
-            await self._rearm_orders(canceled, cycle_id)
-            return None, retry_exc
-        return order, None
+        # Cancellation is asynchronous at the broker: the DELETE returns before
+        # the held shares are released, so an immediate resubmit can hit the same
+        # qty conflict. Give the cancel a moment to settle between attempts.
+        retry_exc: Exception | None = None
+        for attempt in range(_EXIT_RETRY_ATTEMPTS):
+            await asyncio.sleep(_EXIT_RETRY_DELAY_SECONDS)
+            try:
+                return await self.broker.submit_order(decision.intent), None
+            except Exception as exc:
+                retry_exc = exc
+                if not self._is_conflict_error(exc):
+                    break
+        # The exit still failed after we cleared protection. Put the canceled
+        # orders back so the position is not left unguarded; the position
+        # manager will attempt the exit again next cycle.
+        await self._rearm_orders(canceled, cycle_id)
+        return None, retry_exc
 
     async def _rearm_orders(self, canceled: list[dict], cycle_id: int | None) -> None:
         # Only restore protective (position-reducing) resting orders. Re-arming an
@@ -1032,6 +1059,52 @@ class TradingAgent:
                 metadata=metadata,
             )
         return None
+
+    async def _place_partial_remainder_protection(
+        self,
+        decision: RiskDecision,
+        cycle_id: int | None,
+    ) -> None:
+        # After a partial scale-out the original bracket legs are gone (canceled to
+        # free the sold shares), so the remainder needs fresh protection: a breakeven
+        # stop and the ceiling take-profit as one OCO. If this fails, the engine's
+        # breakeven-floor check still manages the remainder cycle-by-cycle.
+        meta = decision.candidate.metadata
+        symbol = decision.candidate.symbol
+        protective = self._equity_protection_intent(
+            symbol,
+            self._coerce_float(meta.get("remainder_qty")),
+            self._coerce_float(meta.get("remainder_stop_price")),
+            self._coerce_float(meta.get("remainder_take_profit_price")),
+        )
+        if protective is None:
+            return
+        try:
+            protect_order = await self.broker.submit_order(protective)
+        except Exception as exc:
+            self.console.print(
+                f"[yellow]remainder protection not placed[/yellow] {symbol}: {exc}"
+            )
+            self._audit_event(
+                cycle_id,
+                "order",
+                {"intent": protective, "error": str(exc)},
+                symbol=symbol,
+                strategy="equity_protective_exit",
+                status="unprotected",
+                reason=f"Could not place breakeven OCO on the partial-exit remainder: {exc}",
+            )
+            return
+        self._audit_event(
+            cycle_id,
+            "order",
+            {"intent": protective, "broker_order": protect_order},
+            symbol=symbol,
+            strategy="equity_protective_exit",
+            status="submitted",
+            reason="Breakeven/ceiling OCO placed on the remainder after a partial profit-take.",
+        )
+        self.console.print(f"[green]remainder protected[/green] {symbol}")
 
     def _warn_unprotected(self, order: dict, cycle_id: int | None) -> None:
         symbol = str(order.get("symbol") or "")

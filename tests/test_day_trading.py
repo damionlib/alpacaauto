@@ -91,7 +91,7 @@ def test_day_trading_exit_triggers_on_stop_loss() -> None:
     assert candidate is not None
     assert candidate.strategy == "day_trade_exit"
     assert candidate.metadata["exit"] is True
-    assert "stop loss" in signal["reason"]
+    assert "floor" in signal["reason"].lower() or "stop" in signal["reason"].lower()
 
 
 def test_day_trading_exit_trailing_stop_from_peak() -> None:
@@ -259,6 +259,249 @@ def test_day_trading_exit_time_decay_holds_when_profitable() -> None:
     )
     assert candidate is None
     assert signal["status"] == "held"
+
+
+def test_day_trading_entry_computes_adr_ceiling_floor() -> None:
+    settings = Settings.model_validate({
+        "day_trading": {"enabled": True, "ceiling_adr_fraction": 0.55, "floor_adr_fraction": 0.40},
+    })
+    engine = DayTradingEngine(settings)
+    market = _market(price=150)
+    market.metadata["adr_pct"] = 2.5
+
+    candidate, signal = engine.evaluate_entry(market, _research(), _prediction(), [], trades_used_today=0)
+
+    assert candidate is not None
+    assert candidate.metadata["ceiling_pct"] == round(2.5 * 0.55, 4)
+    assert candidate.metadata["floor_pct"] == round(2.5 * 0.40, 4)
+    assert candidate.take_profit_price > candidate.entry_price
+    assert candidate.stop_price < candidate.entry_price
+
+
+def test_day_trading_entry_caps_adr_targets_at_config_max() -> None:
+    settings = Settings.model_validate({
+        "day_trading": {
+            "enabled": True,
+            "ceiling_adr_fraction": 0.55,
+            "floor_adr_fraction": 0.40,
+            "take_profit_pct": 1.0,
+            "stop_loss_pct": 0.5,
+        },
+    })
+    engine = DayTradingEngine(settings)
+    market = _market(price=150)
+    market.metadata["adr_pct"] = 5.0
+
+    candidate, _ = engine.evaluate_entry(market, _research(), _prediction(), [], trades_used_today=0)
+
+    assert candidate.metadata["ceiling_pct"] == 1.0
+    assert candidate.metadata["floor_pct"] == 0.5
+
+
+def test_day_trading_exit_adr_ceiling_hit() -> None:
+    settings = Settings.model_validate({
+        "day_trading": {"enabled": True, "ceiling_adr_fraction": 0.55, "floor_adr_fraction": 0.40},
+    })
+    engine = DayTradingEngine(settings)
+    entry_event = {
+        "id": 10,
+        "created_at": (datetime.now(UTC) - timedelta(minutes=30)).isoformat(),
+        "payload": {"intent": {"metadata": {"ceiling_pct": 1.375, "floor_pct": 1.0}}},
+    }
+    position = Position(
+        symbol="AAPL", asset_class=AssetClass.EQUITY, qty=10,
+        market_value=1_320, avg_entry_price=130, current_price=131.8,
+    )
+    candidate, signal = engine.evaluate_exit(
+        position, _market(price=131.8), _research(), _prediction(), entry_event=entry_event,
+    )
+    assert candidate is not None
+    assert "ceiling" in signal["reason"].lower()
+
+
+def test_day_trading_exit_adr_floor_hit() -> None:
+    settings = Settings.model_validate({
+        "day_trading": {"enabled": True, "ceiling_adr_fraction": 0.55, "floor_adr_fraction": 0.40},
+    })
+    engine = DayTradingEngine(settings)
+    entry_event = {
+        "id": 10,
+        "created_at": (datetime.now(UTC) - timedelta(minutes=30)).isoformat(),
+        "payload": {"intent": {"metadata": {"ceiling_pct": 1.375, "floor_pct": 1.0}}},
+    }
+    position = Position(
+        symbol="AAPL", asset_class=AssetClass.EQUITY, qty=10,
+        market_value=1_286, avg_entry_price=130, current_price=128.6,
+    )
+    candidate, signal = engine.evaluate_exit(
+        position, _market(price=128.6), _research(), _prediction(), entry_event=entry_event,
+    )
+    assert candidate is not None
+    assert "floor" in signal["reason"].lower()
+
+
+def test_day_trading_exit_holds_patiently_within_range() -> None:
+    settings = Settings.model_validate({
+        "day_trading": {
+            "enabled": True,
+            "profit_protect_pct": 0,
+            "stale_negative_minutes": 0,
+            "time_decay_minutes": 0,
+            "max_position_minutes": 480,
+        },
+    })
+    engine = DayTradingEngine(settings)
+    entry_event = {
+        "id": 10,
+        "created_at": (datetime.now(UTC) - timedelta(minutes=90)).isoformat(),
+        "payload": {"intent": {"metadata": {"ceiling_pct": 1.375, "floor_pct": 1.0}}},
+    }
+    position = Position(
+        symbol="AAPL", asset_class=AssetClass.EQUITY, qty=10,
+        market_value=1_296, avg_entry_price=130, current_price=129.7,
+    )
+    candidate, signal = engine.evaluate_exit(
+        position, _market(price=129.7), _research(), _prediction(), entry_event=entry_event,
+    )
+    assert candidate is None
+    assert signal["status"] == "held"
+
+
+def _partial_entry_event(qty: float = 10, minutes_ago: int = 60) -> dict:
+    return {
+        "id": 10,
+        "created_at": (datetime.now(UTC) - timedelta(minutes=minutes_ago)).isoformat(),
+        "payload": {
+            "intent": {
+                "qty": qty,
+                "metadata": {"ceiling_pct": 1.375, "floor_pct": 1.0, "partial_pct": 0.9},
+            }
+        },
+    }
+
+
+def test_day_trading_partial_exit_at_target() -> None:
+    settings = Settings.model_validate({"day_trading": {"enabled": True}})
+    engine = DayTradingEngine(settings)
+    position = Position(
+        symbol="AAPL", asset_class=AssetClass.EQUITY, qty=10,
+        market_value=1_313, avg_entry_price=130, current_price=131.3,
+    )
+
+    candidate, signal = engine.evaluate_exit(
+        position, _market(price=131.3), _research(), _prediction(),
+        entry_event=_partial_entry_event(qty=10),
+    )
+
+    assert candidate is not None
+    assert candidate.metadata["partial_exit"] is True
+    assert candidate.metadata["exit_qty"] == 5
+    assert candidate.metadata["remainder_qty"] == 5
+    assert candidate.metadata["remainder_stop_price"] == 130.0
+    assert candidate.metadata["remainder_take_profit_price"] == round(130 * 1.01375, 2)
+    assert "Partial profit-take" in signal["reason"]
+    # position stays open, so peak tracking must survive the partial
+    assert "AAPL" in engine._peak_pnl
+
+
+def test_day_trading_partial_remainder_breakeven_stop() -> None:
+    settings = Settings.model_validate({"day_trading": {"enabled": True}})
+    engine = DayTradingEngine(settings)
+    # qty 5 vs entry qty 10 -> the partial already banked; remainder is guarded at breakeven
+    position = Position(
+        symbol="AAPL", asset_class=AssetClass.EQUITY, qty=5,
+        market_value=649, avg_entry_price=130, current_price=129.9,
+    )
+
+    candidate, signal = engine.evaluate_exit(
+        position, _market(price=129.9), _research(), _prediction(),
+        entry_event=_partial_entry_event(qty=10),
+    )
+
+    assert candidate is not None
+    assert candidate.metadata.get("partial_exit") is None
+    assert "Breakeven stop" in signal["reason"]
+
+
+def test_day_trading_partial_remainder_rides_to_ceiling() -> None:
+    settings = Settings.model_validate({"day_trading": {"enabled": True}})
+    engine = DayTradingEngine(settings)
+    position = Position(
+        symbol="AAPL", asset_class=AssetClass.EQUITY, qty=5,
+        market_value=660, avg_entry_price=130, current_price=131.9,
+    )
+
+    candidate, signal = engine.evaluate_exit(
+        position, _market(price=131.9), _research(), _prediction(),
+        entry_event=_partial_entry_event(qty=10),
+    )
+
+    assert candidate is not None
+    assert "ceiling" in signal["reason"].lower()
+    assert candidate.metadata["exit_qty"] == 5
+
+
+def test_day_trading_partial_exit_disabled_by_config() -> None:
+    settings = Settings.model_validate({
+        "day_trading": {"enabled": True, "partial_exit_size": 0},
+    })
+    engine = DayTradingEngine(settings)
+    position = Position(
+        symbol="AAPL", asset_class=AssetClass.EQUITY, qty=10,
+        market_value=1_313, avg_entry_price=130, current_price=131.3,
+    )
+
+    candidate, signal = engine.evaluate_exit(
+        position, _market(price=131.3), _research(), _prediction(),
+        entry_event=_partial_entry_event(qty=10),
+    )
+
+    assert candidate is None
+    assert signal["status"] == "held"
+
+
+def test_day_trading_partial_exit_skipped_for_single_share() -> None:
+    settings = Settings.model_validate({"day_trading": {"enabled": True}})
+    engine = DayTradingEngine(settings)
+    position = Position(
+        symbol="AAPL", asset_class=AssetClass.EQUITY, qty=1,
+        market_value=131, avg_entry_price=130, current_price=131.3,
+    )
+
+    candidate, signal = engine.evaluate_exit(
+        position, _market(price=131.3), _research(), _prediction(),
+        entry_event=_partial_entry_event(qty=1),
+    )
+
+    assert candidate is None
+    assert signal["status"] == "held"
+
+
+def test_day_trade_setup_risk_multiplier_halves_orb_size() -> None:
+    settings = Settings.model_validate({"day_trading": {"enabled": True}})
+    engine = RiskEngine(settings)
+    account = AccountSnapshot(equity=100_000, cash=100_000, buying_power=100_000, last_equity=100_000)
+
+    def _candidate(setup: str) -> "TradeCandidate":
+        from trading_agent.models import TradeCandidate
+        return TradeCandidate(
+            symbol="GE",
+            asset_class=AssetClass.EQUITY,
+            side=OrderSide.BUY,
+            strategy="day_trade_entry",
+            score=85,
+            entry_price=150,
+            stop_price=148.5,
+            metadata={"day_trade": True, "day_trade_entry": True, "setup": setup},
+        )
+
+    trend = engine.evaluate(_candidate("trend_continuation"), account, [])
+    orb = engine.evaluate(_candidate("opening_range_break"), account, [])
+
+    assert trend.approved and orb.approved
+    assert trend.intent is not None and orb.intent is not None
+    assert orb.intent.qty <= trend.intent.qty / 2 + 1
+    assert orb.intent.qty >= 1
 
 
 def test_day_trade_risk_uses_tighter_position_sizing() -> None:

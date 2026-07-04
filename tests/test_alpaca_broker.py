@@ -75,3 +75,28 @@ def test_asset_class_detects_option_symbol_even_if_broker_reports_equity() -> No
     broker = AlpacaBroker.__new__(AlpacaBroker)
 
     assert broker._asset_class_from_alpaca("equity", "AAPL260612C00322500").value == "option"
+
+
+@pytest.mark.anyio
+async def test_cancel_order_handles_204_no_content(respx_mock) -> None:
+    respx_mock.delete("https://paper-api.alpaca.markets/v2/orders/abc-123").respond(204)
+    broker = AlpacaBroker.__new__(AlpacaBroker)
+    broker.trading_base_url = "https://paper-api.alpaca.markets"
+    broker.headers = {"APCA-API-KEY-ID": "k", "APCA-API-SECRET-KEY": "s"}
+
+    # Must not raise: Alpaca returns 204 with an empty body on cancel, and an
+    # exception here makes the caller believe the cancel failed when it worked.
+    await broker.cancel_order("abc-123")
+
+
+@pytest.mark.anyio
+async def test_request_raises_on_error_status(respx_mock) -> None:
+    respx_mock.delete("https://paper-api.alpaca.markets/v2/orders/bad-1").respond(
+        403, json={"code": 40310000, "message": "insufficient qty available"}
+    )
+    broker = AlpacaBroker.__new__(AlpacaBroker)
+    broker.trading_base_url = "https://paper-api.alpaca.markets"
+    broker.headers = {"APCA-API-KEY-ID": "k", "APCA-API-SECRET-KEY": "s"}
+
+    with pytest.raises(RuntimeError, match="insufficient qty"):
+        await broker.cancel_order("bad-1")
