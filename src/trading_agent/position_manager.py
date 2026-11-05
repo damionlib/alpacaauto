@@ -1,12 +1,59 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 
 from trading_agent.audit import AuditStore
 from trading_agent.config import Settings
 from trading_agent.models import AssetClass, OrderSide, Position, TradeCandidate
 
 OPTION_MULTIPLIER = 100
+
+
+@dataclass(frozen=True)
+class SwingStop:
+    level: float
+    basis: str  # "initial_atr_stop" | "breakeven_stop" | "chandelier_stop"
+    atr: float
+    initial_stop: float
+
+
+def swing_stop_level(
+    *,
+    entry_price: float,
+    atr_value: float,
+    peak_price: float,
+    initial_stop: float,
+    breakeven_trigger_atr: float,
+    chandelier_atr_multiple: float,
+) -> tuple[float, str]:
+    """Ratcheting long stop: initial ATR stop -> breakeven -> chandelier trail.
+
+    The level only ever rises with the peak price, so it can be held at the
+    broker as a resting stop and replaced upward. No fixed take-profit: winners
+    run until the trail is hit.
+    """
+    level, basis = initial_stop, "initial_atr_stop"
+    if breakeven_trigger_atr > 0 and peak_price - entry_price >= breakeven_trigger_atr * atr_value:
+        if entry_price > level:
+            level, basis = entry_price, "breakeven_stop"
+    chandelier = peak_price - chandelier_atr_multiple * atr_value
+    if chandelier > level:
+        level, basis = chandelier, "chandelier_stop"
+    return level, basis
+
+
+def trading_days_between(start: date, end: date) -> int:
+    """Weekdays elapsed from start to end (exchange holidays not excluded)."""
+    if end <= start:
+        return 0
+    days = (end - start).days
+    full_weeks, remainder = divmod(days, 7)
+    count = full_weeks * 5
+    for offset in range(1, remainder + 1):
+        if (start + timedelta(days=offset)).weekday() < 5:
+            count += 1
+    return count
 
 
 class PositionManager:
@@ -240,7 +287,7 @@ class PositionManager:
 
     def _spread_metrics(self, *, cost_basis: float, current_price: float, pnl_pct: float, state: dict) -> dict:
         first_seen_at = datetime.fromisoformat(state["first_seen_at"])
-        holding_days = max((datetime.now(UTC) - first_seen_at).days, 0)
+        holding_days = trading_days_between(first_seen_at.date(), datetime.now(UTC).date())
         peak_price = float(state["peak_price"])
         trough_price = float(state["trough_price"])
         trailing_drawdown_pct = 0.0
@@ -303,7 +350,7 @@ class PositionManager:
             pnl_pct = ((current_price - position.avg_entry_price) / position.avg_entry_price) * 100 * direction
 
         first_seen_at = datetime.fromisoformat(state["first_seen_at"])
-        holding_days = max((datetime.now(UTC) - first_seen_at).days, 0)
+        holding_days = trading_days_between(first_seen_at.date(), datetime.now(UTC).date())
         peak_price = float(state["peak_price"])
         trough_price = float(state["trough_price"])
         trailing_drawdown_pct = 0.0
@@ -349,6 +396,9 @@ class PositionManager:
             else self.settings.position_manager.take_profit_pct
         )
 
+        swing_stop = self.swing_stop(position, metrics)
+        if swing_stop is not None:
+            return self._atr_exit_reason(position, metrics, swing_stop, stop_loss_pct)
         if pnl_pct <= -stop_loss_pct:
             return {
                 "strategy": "stop_loss_exit",
@@ -381,6 +431,74 @@ class PositionManager:
                     ],
                 }
 
+        return self._time_exit_reason(position, metrics)
+
+    def swing_stop(self, position: Position, metrics: dict | None = None) -> SwingStop | None:
+        """Current ratcheting stop for an ATR-managed swing long, else None.
+
+        None means the position falls back to the legacy percent rules: not an
+        equity long, ATR mode off, or no entry ATR recorded (e.g. entered before
+        ATR stops existed, or by another engine).
+        """
+        cfg = self.settings.position_manager
+        if cfg.equity_exit_mode != "atr":
+            return None
+        if position.asset_class not in {AssetClass.EQUITY, AssetClass.ETF} or position.qty <= 0:
+            return None
+        if not position.avg_entry_price or position.avg_entry_price <= 0:
+            return None
+        meta = self._entry_metadata(position.symbol, position.avg_entry_price)
+        atr_value = self._float(meta.get("atr"))
+        if not atr_value or atr_value <= 0:
+            return None
+        initial_stop = self._float(meta.get("initial_stop"))
+        entry_price = position.avg_entry_price
+        if not initial_stop or initial_stop >= entry_price:
+            initial_stop = entry_price - self.settings.strategy.atr_stop_multiple * atr_value
+        if metrics is None:
+            current_price = self._current_price(position) or entry_price
+            state = self._update_state(position, current_price)
+            peak_price = float(state["peak_price"])
+        else:
+            peak_price = float(metrics.get("peak_price") or entry_price)
+        level, basis = swing_stop_level(
+            entry_price=entry_price,
+            atr_value=atr_value,
+            peak_price=max(peak_price, entry_price),
+            initial_stop=initial_stop,
+            breakeven_trigger_atr=cfg.breakeven_trigger_atr,
+            chandelier_atr_multiple=cfg.chandelier_atr_multiple,
+        )
+        return SwingStop(level=round(level, 2), basis=basis, atr=atr_value, initial_stop=round(initial_stop, 2))
+
+    def _atr_exit_reason(
+        self, position: Position, metrics: dict, swing_stop: SwingStop, stop_loss_pct: float,
+    ) -> dict | None:
+        pnl_pct = metrics["pnl_pct"]
+        current_price = metrics["current_price"]
+        if pnl_pct is not None and pnl_pct <= -stop_loss_pct:
+            return {
+                "strategy": "stop_loss_exit",
+                "score": 100,
+                "rationale": [f"Position P/L is {pnl_pct:.2f}%, below hard stop {-stop_loss_pct:.2f}%."],
+            }
+        if current_price <= swing_stop.level:
+            strategy = {
+                "initial_atr_stop": "atr_stop_exit",
+                "breakeven_stop": "breakeven_stop_exit",
+                "chandelier_stop": "chandelier_stop_exit",
+            }[swing_stop.basis]
+            return {
+                "strategy": strategy,
+                "score": 100 if swing_stop.basis == "initial_atr_stop" else 95,
+                "rationale": [
+                    f"Price {current_price:.2f} is at/below the {swing_stop.basis.replace('_', ' ')} "
+                    f"{swing_stop.level:.2f} (ATR {swing_stop.atr:.2f}, peak {metrics['peak_price']:.2f})."
+                ],
+            }
+        return self._time_exit_reason(position, metrics)
+
+    def _time_exit_reason(self, position: Position, metrics: dict) -> dict | None:
         max_days_no_profit = self.settings.position_manager.max_days_without_profit
         if max_days_no_profit and metrics["holding_days"] >= max_days_no_profit:
             peak_price = float(metrics.get("peak_price") or 0)
@@ -392,20 +510,53 @@ class PositionManager:
                         "score": 85,
                         "rationale": [
                             f"Position never meaningfully profitable (peak P/L {peak_pnl_pct:.2f}%) "
-                            f"after {metrics['holding_days']} days; cutting the dead weight."
+                            f"after {metrics['holding_days']} trading days; cutting the dead weight."
                         ],
                     }
-
         max_holding_days = self.settings.position_manager.max_holding_days
         if max_holding_days and metrics["holding_days"] >= max_holding_days:
             return {
                 "strategy": "time_exit",
                 "score": 80,
                 "rationale": [
-                    f"Position has been tracked for {metrics['holding_days']} days, meeting max holding period."
+                    f"Position has been held {metrics['holding_days']} trading days, meeting max holding period."
                 ],
             }
         return None
+
+    def _entry_metadata(self, symbol: str, avg_entry_price: float | None = None) -> dict:
+        """Entry metadata (ATR, initial stop) of the swing order that opened this position.
+
+        Only trusted when that order is recent and priced like the position. A
+        position the swing engine did not open (e.g. a day trade that failed to
+        exit and was adopted the next morning) must not inherit the ATR/stop of
+        an old, unrelated swing trade in the same symbol; it falls back to the
+        legacy percent rules instead.
+        """
+        if not self.audit:
+            return {}
+        event = self.audit.latest_swing_entry_for_symbol(symbol)
+        if not event:
+            return {}
+        intent = (event.get("payload") or {}).get("intent") or {}
+        try:
+            created = datetime.fromisoformat(str(event.get("created_at")).replace("Z", "+00:00"))
+        except ValueError:
+            return {}
+        max_age_days = max(self.settings.position_manager.max_holding_days, 1) * 2 + 7
+        if datetime.now(UTC) - created > timedelta(days=max_age_days):
+            return {}
+        limit_price = self._float(intent.get("limit_price"))
+        if avg_entry_price and limit_price and abs(avg_entry_price / limit_price - 1) > 0.02:
+            return {}
+        return intent.get("metadata") or {}
+
+    @staticmethod
+    def _float(value) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _profit_lock_exit_reason(self, position: Position, metrics: dict) -> dict | None:
         if not self.settings.position_manager.profit_lock_enabled:

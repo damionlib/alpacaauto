@@ -17,12 +17,18 @@ class ScreenedSymbol:
     score: float
     reasons: list[str]
     snapshot: MarketSnapshot
+    # Unclamped score used for ordering. Dozens of symbols hit the 100 cap, and
+    # ranking on the capped value left the cut to universe-list order.
+    rank_score: float = 0.0
 
 
 class MarketScreener:
     def __init__(self, settings: Settings, broker: Broker) -> None:
         self.settings = settings
         self.broker = broker
+        # Errors from the last top_symbols() run, so a data outage is visible in
+        # the audit log instead of silently shrinking the universe.
+        self.last_errors: list[str] = []
 
     async def day_trade_symbols(self) -> list[str]:
         getter = getattr(self.broker, "get_most_actives", None)
@@ -58,6 +64,7 @@ class MarketScreener:
         if not self.settings.screener.enabled:
             return []
 
+        self.last_errors = []
         raw_symbols = symbols_for_universes(self.settings.screener.universes)
         if self.settings.day_trading.enabled:
             live_symbols = await self.day_trade_symbols()
@@ -85,7 +92,8 @@ class MarketScreener:
                     bars = bar_data.get(sym)
                     if not bars:
                         continue
-                    closes, volumes = bars
+                    closes = bars["closes"]
+                    volumes = bars["volumes"]
                     if not closes:
                         continue
                     price = closes[-1]
@@ -96,7 +104,11 @@ class MarketScreener:
                     snapshot = MarketSnapshot(
                         symbol=sym, asset_class=AssetClass.EQUITY,
                         price=price, closes=closes,
-                        metadata={"volumes": volumes},
+                        metadata={
+                            "volumes": volumes,
+                            "highs": bars.get("highs", []),
+                            "lows": bars.get("lows", []),
+                        },
                     )
                     scored = self.score_snapshot(snapshot)
                     if scored:
@@ -126,19 +138,28 @@ class MarketScreener:
         ]
         equity_limit = max(self.settings.screener.max_candidates - self.settings.screener.max_crypto_candidates, 0)
         selected = [
-            *sorted(equity_candidates, key=lambda item: item.score, reverse=True)[:equity_limit],
-            *sorted(crypto_candidates, key=lambda item: item.score, reverse=True)[: self.settings.screener.max_crypto_candidates],
+            *sorted(equity_candidates, key=lambda item: item.rank_score, reverse=True)[:equity_limit],
+            *sorted(crypto_candidates, key=lambda item: item.rank_score, reverse=True)[: self.settings.screener.max_crypto_candidates],
         ]
-        return sorted(selected, key=lambda item: item.score, reverse=True)[: self.settings.screener.max_candidates]
+        return sorted(selected, key=lambda item: item.rank_score, reverse=True)[: self.settings.screener.max_candidates]
 
-    async def _get_bars_for_symbols(self, symbols: list[str]) -> dict[str, tuple[list[float], list[float]]]:
-        getter = getattr(self.broker, "_get_stock_bars", None)
-        if not getter:
+    async def _get_bars_for_symbols(self, symbols: list[str]) -> dict[str, dict[str, list[float]]]:
+        getter = getattr(self.broker, "get_daily_bars", None)
+        if getter:
+            try:
+                return await getter(symbols)
+            except Exception as exc:
+                self.last_errors.append(f"daily bars failed for {len(symbols)} symbols: {exc}")
+                return {}
+        legacy = getattr(self.broker, "_get_stock_bars", None)
+        if not legacy:
             return {}
         try:
-            return await getter(symbols)
-        except Exception:
+            rows = await legacy(symbols)
+        except Exception as exc:
+            self.last_errors.append(f"daily bars failed for {len(symbols)} symbols: {exc}")
             return {}
+        return {symbol: {"closes": closes, "volumes": volumes} for symbol, (closes, volumes) in rows.items()}
 
     async def _screen_symbol(self, symbol: str) -> ScreenedSymbol | None:
         try:
@@ -168,7 +189,8 @@ class MarketScreener:
         volatility_points = max(20 - (vol20 / 5), 0)
         liquidity_points = self._liquidity_points(snapshot)
         crypto_bonus = 5 if snapshot.asset_class == AssetClass.CRYPTO else 0
-        score = max(0.0, min(100.0, 20 + trend_points + momentum_points + volatility_points + liquidity_points + crypto_bonus))
+        raw_score = 20 + trend_points + momentum_points + volatility_points + liquidity_points + crypto_bonus
+        score = max(0.0, min(100.0, raw_score))
 
         if score < self.settings.screener.min_trend_score:
             return None
@@ -188,6 +210,7 @@ class MarketScreener:
             score=round(score, 2),
             reasons=reasons,
             snapshot=snapshot,
+            rank_score=round(raw_score + change20 * 0.01, 4),
         )
 
     def _avg_dollar_volume(self, snapshot: MarketSnapshot) -> float:

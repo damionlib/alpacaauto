@@ -151,7 +151,7 @@ async def test_agent_prefers_swing_candidate_over_day_trade_same_symbol() -> Non
     day_signals = [kwargs for args, kwargs in events if args[1] == "day_trade_signal"]
     assert day_signals
     assert day_signals[0]["status"] == "blocked"
-    assert "preferring swing" in day_signals[0]["reason"]
+    assert "day trade yields" in day_signals[0]["reason"]
 
 
 def test_agent_blocks_swing_entry_after_same_day_day_trade_entry() -> None:

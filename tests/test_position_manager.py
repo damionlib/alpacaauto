@@ -122,7 +122,7 @@ def test_position_manager_keeps_winner_above_locked_profit(tmp_path) -> None:
 def test_position_manager_creates_time_exit(tmp_path) -> None:
     store = AuditStore(tmp_path / "audit.sqlite3")
     manager = PositionManager(Settings(), store)
-    old_date = (datetime.now(UTC) - timedelta(days=25)).isoformat()
+    old_date = (datetime.now(UTC) - timedelta(days=30)).isoformat()
     with store._connect() as connection:
         connection.execute(
             """

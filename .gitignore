@@ -50,3 +50,7 @@ data/
 # Local-only config overrides
 config/*.local.toml
 config/*.private.toml
+
+# Backtest data caches and generated evaluation reports
+research/cache/
+reports/

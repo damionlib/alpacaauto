@@ -38,6 +38,20 @@ class AgentConfig(BaseModel):
         return self.live_max_total_orders_per_day if live else self.paper_max_total_orders_per_day
 
 
+class MarketDataConfig(BaseModel):
+    # Daily bars feed. "sip" is the consolidated tape (all exchanges); "iex" is a
+    # single venue carrying ~3-6% of volume, which made the dollar-volume filter
+    # 20-35x too strict. The free plan serves SIP only for data older than ~15
+    # minutes, so historical requests end sip_delay_minutes in the past.
+    historical_feed: Literal["sip", "iex"] = "sip"
+    sip_delay_minutes: int = Field(default=16, ge=15, le=120)
+    # Calendar days of daily history. ~420 days gives ~290 bars: enough for a
+    # 200-day average, 52-week high and 12-month momentum.
+    daily_lookback_days: int = Field(default=420, ge=100, le=3650)
+    # Split/dividend-adjusted bars, so a split does not look like a crash.
+    adjustment: Literal["raw", "split", "dividend", "all"] = "all"
+
+
 class AuditConfig(BaseModel):
     enabled: bool = True
     database_path: str = "data/trading_agent.sqlite3"
@@ -66,6 +80,17 @@ class PositionManagerConfig(BaseModel):
     manage_options: bool = True
     option_stop_loss_pct: float = Field(default=40.0, gt=0, le=100)
     option_take_profit_pct: float = Field(default=80.0, gt=0, le=1000)
+    # "atr": swing equity longs that carry an entry ATR exit on one volatility-
+    # scaled stop that only ratchets up (initial ATR stop -> breakeven ->
+    # chandelier trail), with no fixed take-profit cap. The same level is kept
+    # resting at the broker as a GTC stop. "percent": the legacy fixed-% rules.
+    # Positions with no recorded ATR always fall back to the legacy rules.
+    equity_exit_mode: Literal["atr", "percent"] = "atr"
+    breakeven_trigger_atr: float = Field(default=1.5, ge=0, le=10)
+    chandelier_atr_multiple: float = Field(default=3.0, gt=0, le=10)
+    # Minimum upward move (in ATRs) before the resting broker stop is replaced,
+    # so the stop is not re-sent every cycle for cent-level changes.
+    stop_ratchet_min_atr: float = Field(default=0.1, ge=0, le=2)
 
     @model_validator(mode="after")
     def _validate_profit_lock(self) -> "PositionManagerConfig":
@@ -120,6 +145,17 @@ class StrategyConfig(BaseModel):
     min_signal_score: float = Field(default=70.0, ge=0, le=100)
     max_option_entry_orders_per_underlying_per_day: int = Field(default=1, ge=0)
     option_loss_cooldown_minutes: int = Field(default=1440, ge=0)
+    # Swing initial stop = entry - atr_stop_multiple x ATR(atr_period), clamped
+    # to [min_stop_pct, max_stop_pct] of price.
+    atr_period: int = Field(default=14, ge=2, le=100)
+    atr_stop_multiple: float = Field(default=2.5, gt=0, le=10)
+    min_stop_pct: float = Field(default=3.0, gt=0, le=50)
+    max_stop_pct: float = Field(default=12.0, gt=0, le=50)
+    # Swing signals are built on daily bars, so decide them near the close when
+    # the daily bar is nearly final, instead of re-deciding every 5 minutes on
+    # intraday noise. Entries are allowed from this many minutes before the close
+    # until execution.close_buffer_minutes before it. 0 = any time the market is open.
+    swing_entry_window_minutes: int = Field(default=0, ge=0, le=390)
 
 
 class ScreenerConfig(BaseModel):
@@ -175,6 +211,14 @@ class DayTradingConfig(BaseModel):
     setup_risk_multipliers: dict[str, float] = Field(
         default_factory=lambda: {"opening_range_break": 0.5}
     )
+    # An opening-range break only counts this many minutes after the open.
+    orb_valid_minutes: int = Field(default=120, ge=15, le=390)
+    # No new day-trade entries within this many minutes of the close (0 = off):
+    # a late entry has no time left to reach its ADR target.
+    last_entry_minutes_before_close: int = Field(default=0, ge=0, le=390)
+    # Exit when the intraday score falls to exit_intraday_score. Conflicts with
+    # holding to the ADR ceiling/floor; validated by the minute-bar backtest.
+    intraday_score_exit_enabled: bool = True
     profit_protect_pct: float = Field(default=0.4, ge=0, le=10)
     profit_trail_pct: float = Field(default=0.5, ge=0, le=10)
     stale_negative_minutes: int = Field(default=30, ge=0)
@@ -226,6 +270,7 @@ class Settings(BaseModel):
     broker: BrokerConfig = Field(default_factory=BrokerConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     audit: AuditConfig = Field(default_factory=AuditConfig)
+    market_data: MarketDataConfig = Field(default_factory=MarketDataConfig)
     position_manager: PositionManagerConfig = Field(default_factory=PositionManagerConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)

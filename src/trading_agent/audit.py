@@ -388,6 +388,24 @@ class AuditStore:
             ).fetchone()
         return self._event_row(row) if row else None
 
+    def latest_swing_entry_for_symbol(self, symbol: str) -> dict[str, Any] | None:
+        """Most recent submitted swing (non-day-trade) equity entry order for symbol."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                select *
+                from audit_events
+                where event_type = 'order'
+                  and status = 'submitted'
+                  and (strategy like '%\\_momentum' escape '\\' or strategy like '%\\_catalyst' escape '\\')
+                  and upper(symbol) = upper(?)
+                order by id desc
+                limit 1
+                """,
+                (symbol,),
+            ).fetchone()
+        return self._event_row(row) if row else None
+
     def broker_order_update_exists(self, broker_order_id: str) -> bool:
         pattern = f'%"id": "{broker_order_id}"%'
         with self._connect() as connection:

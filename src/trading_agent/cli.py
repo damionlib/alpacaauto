@@ -179,6 +179,59 @@ def screen(config: str = "config/settings.toml") -> None:
     asyncio.run(_run())
 
 
+@app.command("session-window")
+def session_window(config: str = "config/settings.toml", stop_after_close_minutes: int = 20) -> None:
+    """Print JSON: whether today is a trading session and when the runner should stop."""
+    import json
+
+    from trading_agent.day_trading.features import EASTERN
+
+    async def _run() -> None:
+        clock = await AlpacaBroker(load_settings(config)).get_clock()
+        today = datetime.now(UTC).astimezone(EASTERN).date()
+        next_open = datetime.fromisoformat(str(clock["next_open"]).replace("Z", "+00:00"))
+        next_close = datetime.fromisoformat(str(clock["next_close"]).replace("Z", "+00:00"))
+        trading_day = bool(clock.get("is_open")) or next_open.astimezone(EASTERN).date() == today
+        stop = next_close + timedelta(minutes=stop_after_close_minutes)
+        print(json.dumps({
+            "trading_day": trading_day,
+            "is_open": bool(clock.get("is_open")),
+            "close": next_close.isoformat(),
+            "stop_epoch": int(stop.timestamp()) if trading_day else 0,
+        }))
+
+    asyncio.run(_run())
+
+
+@app.command("eval-report")
+def eval_report(
+    config: str = "config/settings.toml",
+    since: str = typer.Option("", help="Evaluation start date (YYYY-MM-DD); defaults to today."),
+    day: str = typer.Option("", help="Report date (YYYY-MM-DD); defaults to today (ET)."),
+    output_dir: str = "reports/paper-eval",
+) -> None:
+    """Write the daily paper-evaluation report (Markdown + JSON summary)."""
+    import json
+    from datetime import date as date_type
+
+    from trading_agent.evaluation import build_daily_report
+
+    async def _run() -> None:
+        settings = load_settings(config)
+        report_day = date_type.fromisoformat(day) if day else None
+        since_day = date_type.fromisoformat(since) if since else None
+        report, summary = await build_daily_report(settings, day=report_day, since=since_day)
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        stem = summary["date"]
+        (out / f"{stem}.md").write_text(report)
+        (out / f"{stem}.json").write_text(json.dumps(summary, indent=2, default=str))
+        console.print(report)
+        console.print(f"[green]wrote[/green] {out / (stem + '.md')}")
+
+    asyncio.run(_run())
+
+
 @app.command()
 def loop(config: str = "config/settings.toml") -> None:
     settings = load_settings(config)

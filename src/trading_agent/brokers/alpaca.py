@@ -9,6 +9,12 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from trading_agent.config import Settings
+from trading_agent.day_trading.features import (
+    EASTERN,
+    cumulative_volume_profile,
+    intraday_features,
+    regular_session_bars,
+)
 from trading_agent.models import (
     AccountSnapshot,
     AssetClass,
@@ -36,6 +42,7 @@ class AlpacaBroker:
             "APCA-API-KEY-ID": settings.alpaca_api_key_id.get_secret_value(),
             "APCA-API-SECRET-KEY": settings.alpaca_api_secret_key.get_secret_value(),
         }
+        self._volume_profiles: dict[tuple[str, Any], list[float]] = {}
 
     async def _request(
         self,
@@ -192,6 +199,23 @@ class AlpacaBroker:
     async def close_position(self, symbol: str) -> dict:
         return await self._request("DELETE", f"{self.trading_base_url}/v2/positions/{symbol}")
 
+    async def replace_order(
+        self,
+        order_id: str,
+        *,
+        qty: float | None = None,
+        stop_price: float | None = None,
+        limit_price: float | None = None,
+    ) -> dict:
+        payload: dict[str, Any] = {}
+        if qty is not None:
+            payload["qty"] = self._format_qty(qty)
+        if stop_price is not None:
+            payload["stop_price"] = round(stop_price, 2)
+        if limit_price is not None:
+            payload["limit_price"] = round(limit_price, 2)
+        return await self._request("PATCH", f"{self.trading_base_url}/v2/orders/{order_id}", json=payload)
+
     async def cancel_order(self, order_id: str) -> None:
         await self._request("DELETE", f"{self.trading_base_url}/v2/orders/{order_id}")
 
@@ -228,14 +252,17 @@ class AlpacaBroker:
             params={"feed": "iex"},
         )
         price = float(latest["trade"]["p"])
-        bars = await self._get_stock_bars([symbol])
-        closes, volumes = bars.get(symbol, ([], []))
+        series = (await self.get_daily_bars([symbol])).get(symbol) or {}
         return MarketSnapshot(
             symbol=symbol,
             asset_class=AssetClass.EQUITY,
             price=price,
-            closes=closes,
-            metadata={"volumes": volumes},
+            closes=series.get("closes", []),
+            metadata={
+                "volumes": series.get("volumes", []),
+                "highs": series.get("highs", []),
+                "lows": series.get("lows", []),
+            },
         )
 
     async def _get_crypto_snapshot(self, symbol: str) -> MarketSnapshot:
@@ -307,12 +334,11 @@ class AlpacaBroker:
     async def get_intraday_features(
         self,
         symbol: str,
-        daily_volumes: list[float] | None = None,
+        daily_volumes: list[float] | None = None,  # unused; kept for call compatibility
     ) -> dict[str, Any]:
-        """Intraday inputs the day-trade engine needs: bid/ask spread, VWAP,
-        short-term trend, opening-range break, and relative volume. Each piece is
-        best-effort — a failure leaves that field absent (the engine treats it as
-        neutral) rather than breaking the snapshot."""
+        """Intraday inputs the day-trade engine needs: bid/ask, VWAP, short-term
+        trend, opening-range break and relative volume. Each piece is
+        best-effort; a failure leaves the field absent (treated as neutral)."""
         features: dict[str, Any] = {}
         try:
             data = await self._request(
@@ -330,72 +356,58 @@ class AlpacaBroker:
         except Exception:
             pass
         try:
+            now = datetime.now(UTC)
+            today = now.astimezone(EASTERN).date()
             bars = await self._get_intraday_minute_bars(symbol)
-            if bars:
-                features.update(self._intraday_features_from_bars(bars, daily_volumes or []))
+            profile = await self._intraday_volume_profile(symbol, today)
+            features.update(
+                intraday_features(
+                    regular_session_bars(bars, today),
+                    now=now,
+                    volume_profile=profile,
+                    orb_valid_minutes=self.settings.day_trading.orb_valid_minutes,
+                )
+            )
         except Exception:
             pass
         return features
 
     async def _get_intraday_minute_bars(self, symbol: str) -> list[dict[str, Any]]:
+        # Real-time intraday bars must come from IEX on the free data plan (SIP
+        # is only served 15+ minutes late), so relative volume is computed
+        # IEX-vs-IEX history below to keep the venue consistent.
         start = (datetime.now(UTC) - timedelta(hours=12)).isoformat()
-        data = await self._request(
-            "GET",
-            f"{DATA_API_BASE}/v2/stocks/bars",
-            params={
-                "symbols": symbol,
-                "timeframe": "1Min",
-                "start": start,
-                "feed": "iex",
-                "limit": 1000,
-            },
-        )
-        return data.get("bars", {}).get(symbol, []) or []
+        return await self._paged_minute_bars(symbol, start=start)
 
-    def _intraday_features_from_bars(
-        self,
-        bars: list[dict[str, Any]],
-        daily_volumes: list[float],
-    ) -> dict[str, Any]:
-        eastern = ZoneInfo("America/New_York")
-        today = datetime.now(eastern).date()
+    async def _intraday_volume_profile(self, symbol: str, today) -> list[float]:
+        key = (symbol, today)
+        cached = self._volume_profiles.get(key)
+        if cached is not None:
+            return cached
+        start = (datetime.now(UTC) - timedelta(days=16)).isoformat()
+        history = await self._paged_minute_bars(symbol, start=start)
+        profile = cumulative_volume_profile(history, before_day=today, days=10)
+        self._volume_profiles = {k: v for k, v in self._volume_profiles.items() if k[1] == today}
+        self._volume_profiles[key] = profile
+        return profile
+
+    async def _paged_minute_bars(self, symbol: str, *, start: str) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "symbols": symbol,
+            "timeframe": "1Min",
+            "start": start,
+            "feed": "iex",
+            "limit": 10000,
+        }
         rows: list[dict[str, Any]] = []
-        for bar in bars:
-            stamp = bar.get("t")
-            if not stamp:
-                continue
-            when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).astimezone(eastern)
-            if when.date() == today and when.time() >= time(9, 30):
-                rows.append(bar)
-        if not rows:
-            return {}
-
-        closes = [float(bar["c"]) for bar in rows]
-        volumes = [float(bar.get("v") or 0) for bar in rows]
-        features: dict[str, Any] = {}
-
-        weighted = sum(float(bar.get("vw") or bar.get("c") or 0) * float(bar.get("v") or 0) for bar in rows)
-        traded = sum(volumes)
-        if traded > 0:
-            features["vwap"] = round(weighted / traded, 4)
-
-        if len(closes) >= 6 and closes[-6]:
-            features["minute_trend_pct"] = round((closes[-1] - closes[-6]) / closes[-6] * 100, 4)
-
-        opening = rows[:15]
-        if opening:
-            opening_high = max(float(bar["h"]) for bar in opening)
-            features["opening_range_break"] = bool(closes[-1] > opening_high)
-
-        recent_daily = [v for v in (daily_volumes or [])[-20:] if v]
-        avg_daily = (sum(recent_daily) / len(recent_daily)) if recent_daily else 0.0
-        if avg_daily > 0:
-            # Normalise by how much of the 390-minute session has elapsed, so a
-            # value near 1.0 means "trading at its usual pace for this time of day".
-            elapsed = max(min(len(rows) / 390.0, 1.0), 1.0 / 390.0)
-            features["relative_volume"] = round(traded / (avg_daily * elapsed), 3)
-
-        return features
+        for _page in range(20):
+            data = await self._request("GET", f"{DATA_API_BASE}/v2/stocks/bars", params=params)
+            rows.extend((data.get("bars") or {}).get(symbol, []) or [])
+            token = data.get("next_page_token")
+            if not token:
+                break
+            params["page_token"] = token
+        return rows
 
     @staticmethod
     def _coerce_float(value: Any) -> float | None:
@@ -405,29 +417,16 @@ class AlpacaBroker:
             return None
 
     async def get_daily_adr(self, symbol: str, days: int = 20) -> float | None:
-        start = (datetime.now(UTC) - timedelta(days=days * 3)).isoformat()
-        data = await self._request(
-            "GET",
-            f"{DATA_API_BASE}/v2/stocks/bars",
-            params={
-                "symbols": symbol,
-                "timeframe": "1Day",
-                "start": start,
-                "feed": "iex",
-                "limit": days + 5,
-            },
-        )
-        bars = data.get("bars", {}).get(symbol, [])
-        if not bars:
+        series = (await self.get_daily_bars([symbol], lookback_days=days * 3)).get(symbol)
+        if not series or not series["closes"]:
             return None
-        recent = bars[-days:]
-        ranges = []
-        for bar in recent:
-            o = self._coerce_float(bar.get("o"))
-            h = self._coerce_float(bar.get("h"))
-            l = self._coerce_float(bar.get("l"))
-            if o and h and l and o > 0:
-                ranges.append(((h - l) / o) * 100)
+        ranges = [
+            ((high - low) / open_) * 100
+            for open_, high, low in zip(
+                series["opens"][-days:], series["highs"][-days:], series["lows"][-days:], strict=False
+            )
+            if open_ > 0
+        ]
         return sum(ranges) / len(ranges) if ranges else None
 
     async def get_most_actives(self, top: int = 20) -> list[dict[str, Any]]:
@@ -459,20 +458,52 @@ class AlpacaBroker:
         )
         return data if isinstance(data, dict) else {}
 
+    async def get_daily_bars(
+        self, symbols: list[str], *, lookback_days: int | None = None,
+    ) -> dict[str, dict[str, list[float]]]:
+        """Daily OHLCV per symbol, following pagination across all symbols.
+
+        A multi-symbol request is paginated by total bar count, not per symbol;
+        without following next_page_token only the first ~1000 bars (the first
+        dozen or so symbols alphabetically) come back and the rest silently vanish.
+        """
+        cfg = self.settings.market_data
+        now = datetime.now(UTC)
+        start = (now - timedelta(days=lookback_days or cfg.daily_lookback_days)).isoformat()
+        params: dict[str, Any] = {
+            "symbols": ",".join(symbols),
+            "timeframe": "1Day",
+            "start": start,
+            "feed": cfg.historical_feed,
+            "adjustment": cfg.adjustment,
+            "limit": 10000,
+        }
+        if cfg.historical_feed == "sip":
+            params["end"] = (now - timedelta(minutes=cfg.sip_delay_minutes)).isoformat()
+        rows_by_symbol: dict[str, list[dict]] = {}
+        for _page in range(100):
+            data = await self._request("GET", f"{DATA_API_BASE}/v2/stocks/bars", params=params)
+            for symbol, rows in (data.get("bars") or {}).items():
+                rows_by_symbol.setdefault(symbol, []).extend(rows or [])
+            token = data.get("next_page_token")
+            if not token:
+                break
+            params["page_token"] = token
+        return {symbol: self._bars_to_series(rows) for symbol, rows in rows_by_symbol.items()}
+
     async def _get_stock_bars(self, symbols: list[str]) -> dict[str, tuple[list[float], list[float]]]:
-        start = (datetime.now(UTC) - timedelta(days=100)).isoformat()
-        data = await self._request(
-            "GET",
-            f"{DATA_API_BASE}/v2/stocks/bars",
-            params={
-                "symbols": ",".join(symbols),
-                "timeframe": "1Day",
-                "start": start,
-                "feed": "iex",
-                "limit": 1000,
-            },
-        )
-        return self._bars_to_closes_and_volumes(data.get("bars", {}))
+        series = await self.get_daily_bars(symbols)
+        return {symbol: (bars["closes"], bars["volumes"]) for symbol, bars in series.items()}
+
+    @staticmethod
+    def _bars_to_series(rows: list[dict]) -> dict[str, list[float]]:
+        return {
+            "opens": [float(bar["o"]) for bar in rows],
+            "highs": [float(bar["h"]) for bar in rows],
+            "lows": [float(bar["l"]) for bar in rows],
+            "closes": [float(bar["c"]) for bar in rows],
+            "volumes": [float(bar.get("v") or 0) for bar in rows],
+        }
 
     async def _get_crypto_bars(self, symbols: list[str]) -> dict[str, tuple[list[float], list[float]]]:
         start = (datetime.now(UTC) - timedelta(days=100)).isoformat()

@@ -41,23 +41,40 @@ def _minute_bar(i: int, close: float, vol: float) -> dict:
 
 
 def test_intraday_features_from_today_minute_bars() -> None:
-    broker = AlpacaBroker.__new__(AlpacaBroker)
-    bars = [_minute_bar(i, 100.0 + i * 0.1, 1000 + i * 10) for i in range(15)]
-    bars.append(_minute_bar(15, 103.0, 1500))  # break above the opening range
+    from trading_agent.day_trading.features import intraday_features
 
-    features = broker._intraday_features_from_bars(bars, daily_volumes=[1_000_000.0] * 20)
+    bars = [_minute_bar(i, 100.0 + i * 0.1, 1000) for i in range(15)]
+    bars.append(_minute_bar(15, 103.0, 1500))  # break above the 09:30-09:45 range
+    now = datetime.combine(datetime.now(ET).date(), time(9, 46), tzinfo=ET)
+    # Prior sessions traded 500 shares/minute -> 8,000 by 09:46; today ~16,500.
+    profile = [500.0 * (m + 1) for m in range(390)]
 
-    assert "vwap" in features and 100.0 < features["vwap"] < 103.5
+    features = intraday_features(bars, now=now, volume_profile=profile)
+
+    assert 100.0 < features["vwap"] < 103.5
     assert features["minute_trend_pct"] > 0
     assert features["opening_range_break"] is True
-    assert features["relative_volume"] > 0
+    assert features["relative_volume"] == pytest.approx(16_500 / 8_000, rel=1e-3)
+
+
+def test_opening_range_break_expires_and_ignores_future_bars() -> None:
+    from trading_agent.day_trading.features import intraday_features
+
+    bars = [_minute_bar(i, 100.0, 1000) for i in range(15)]
+    bars.append(_minute_bar(200, 101.0, 1000))  # 12:50 ET, above the range
+    late = datetime.combine(datetime.now(ET).date(), time(12, 51), tzinfo=ET)
+    assert intraday_features(bars, now=late, orb_valid_minutes=120)["opening_range_break"] is False
+    early = datetime.combine(datetime.now(ET).date(), time(9, 50), tzinfo=ET)
+    # The 12:50 bar is in the future at 09:50 and must be ignored.
+    assert intraday_features(bars, now=early)["opening_range_break"] is False
 
 
 def test_intraday_features_empty_when_no_today_session() -> None:
-    broker = AlpacaBroker.__new__(AlpacaBroker)
-    # A bar timestamped well before today's session contributes nothing.
+    from trading_agent.day_trading.features import intraday_features, regular_session_bars
+
     old = {"t": "2020-01-02T14:30:00Z", "o": 1, "h": 1, "l": 1, "c": 1, "v": 1, "vw": 1}
-    assert broker._intraday_features_from_bars([old], daily_volumes=[1.0]) == {}
+    today = datetime.now(ET).date()
+    assert intraday_features(regular_session_bars([old], today), now=datetime.now(ET)) == {}
 
 
 @pytest.mark.anyio

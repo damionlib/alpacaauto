@@ -13,13 +13,32 @@ paper_max_total_orders_per_day = 24
 live_max_entry_orders_per_day = 3
 live_max_total_orders_per_day = 6
 
+[market_data]
+# Consolidated (SIP) daily bars, split/dividend adjusted, ~290 bars of history.
+# IEX alone carries ~3-6% of volume and its daily closes are not official closes.
+historical_feed = "sip"
+sip_delay_minutes = 16
+daily_lookback_days = 420
+adjustment = "all"
+
 [audit]
 enabled = true
 database_path = "data/trading_agent_paper_clean_20260624.sqlite3"
 
 [position_manager]
 enabled = true
-stop_loss_pct = 6.0
+# Swing equity longs exit on one ratcheting ATR stop held at the broker as a GTC
+# order: chandelier trail at 2.5 ATR below the peak, raised to breakeven once the
+# peak is 1.5 ATR above entry, no fixed take-profit. Chosen from a 4.9-year
+# backtest of the agent's own entry signals (Nov 2026): vs the old 6%/8%/profit-
+# lock rules at equal sizing, profit factor 1.17 -> 1.41 and average loss
+# -4.1% -> -2.8%. The breakeven step mattered most; without it results were worst.
+equity_exit_mode = "atr"
+breakeven_trigger_atr = 1.5
+chandelier_atr_multiple = 2.5
+stop_ratchet_min_atr = 0.1
+# Hard cap (also the legacy-rule stop for positions without an entry ATR).
+stop_loss_pct = 12.0
 take_profit_pct = 8.0
 trailing_stop_pct = 8.0
 max_holding_days = 20
@@ -36,7 +55,10 @@ option_stop_loss_pct = 40.0
 option_take_profit_pct = 50.0
 
 [risk]
-max_risk_per_trade_pct = 2.0
+# With real ATR stops, risk-based sizing binds: a 3-ATR stop of ~6% sizes at
+# 12.5% (cap 12%); a volatile name with a 10% stop sizes at 7.5%. At 2% every
+# trade hit the 12% cap regardless of volatility.
+max_risk_per_trade_pct = 0.75
 max_daily_loss_pct = 3.0
 max_position_pct = 12.0
 max_crypto_position_pct = 10.0
@@ -78,7 +100,10 @@ symbols = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "BTC/USD", "ETH/USD"]
 # 40% premium stop turns quote noise into realized losses. The remaining
 # option strategies SELL premium, which sits on the profitable side of the
 # same wide quotes.
+# Swing equity momentum re-enabled after the data-layer, catalyst and stop
+# fixes (Nov 2026). Options/crypto strategies stay off.
 enabled = [
+  "equity_momentum",
 ]
 allow_options = true
 allow_crypto = true
@@ -86,11 +111,22 @@ allow_short = true
 min_signal_score = 70.0
 max_option_entry_orders_per_underlying_per_day = 1
 option_loss_cooldown_minutes = 1440
+# Initial swing stop = 3 x ATR14, clamped to 3-12% of price (sets position size;
+# the 2.5-ATR trail is tighter from the first day).
+atr_period = 14
+atr_stop_multiple = 3.0
+min_stop_pct = 3.0
+max_stop_pct = 12.0
+# Decide swing entries in the last hour before the close (until the 10-minute
+# close buffer), when the daily bar the signals use is nearly final. Matches
+# the backtest's entry-at-close assumption.
+swing_entry_window_minutes = 60
 
 [screener]
 enabled = true
 max_candidates = 10
-max_crypto_candidates = 3
+# No crypto strategy is enabled, so crypto screener slots only crowded out equities.
+max_crypto_candidates = 0
 universes = ["nasdaq100", "sp500_core", "crypto_major"]
 min_price = 5.0
 min_avg_dollar_volume = 25000000.0
@@ -124,6 +160,14 @@ min_catalyst_score = 65.0
 min_intraday_score = 70.0
 min_combined_score = 75.0
 exit_intraday_score = 45.0
+# The intraday-score exit fired on routine dips below VWAP and cut trades before
+# the ADR target/floor resolved; disabling it improved both backtest halves
+# (PF 0.84 -> 0.91). Day trading overall showed NO robust edge (PF ~1.0,
+# t ~0 on 224 backtest trades) - keep it paper-only and do not scale it up.
+intraday_score_exit_enabled = false
+# Breakouts count only in the first 2 hours; no new entries in the last 90 minutes.
+orb_valid_minutes = 120
+last_entry_minutes_before_close = 90
 # stop/take_profit are caps on the ADR-derived floor/ceiling. Raised so the caps
 # only bind on genuinely high-ADR names (a 1.0% floor on a 5% ADR stock is a
 # noise-stop at 0.2 ADR).
@@ -132,11 +176,12 @@ take_profit_pct = 3.0
 trailing_stop_pct = 1.0
 ceiling_adr_fraction = 0.55
 floor_adr_fraction = 0.40
-# Partial scale-out: bank half at 0.45xADR (max 1.0%), rest runs to the ceiling
-# behind a breakeven stop. Targets the observed +0.8-1.0% peak-then-fade pattern.
+# Partial scale-out DISABLED (partial_exit_size = 0): in a 75-session minute-bar
+# backtest (Nov 2026, 224 trades) it lowered the result in both halves of the sample
+# (PF 0.91 -> 1.00 when removed). The code path stays for future testing.
 partial_exit_adr_fraction = 0.45
 partial_exit_max_pct = 1.0
-partial_exit_size = 0.5
+partial_exit_size = 0
 profit_protect_pct = 0
 profit_trail_pct = 0
 stale_negative_minutes = 0

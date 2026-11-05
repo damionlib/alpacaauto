@@ -7,8 +7,12 @@ from trading_agent.catalyst.models import CatalystPrediction
 from trading_agent.config import Settings
 from trading_agent.indicators import pct_change, realized_volatility, sma
 from trading_agent.models import AssetClass, MarketSnapshot, OrderSide, ResearchSnapshot, TradeCandidate
+from trading_agent.text_terms import count_terms
 
 
+# Terms are matched as whole words/phrases (see text_terms). Generic words that
+# carry no direction on their own ("profit", "cut", "miss", "could", "rate",
+# "president", "jobs") were removed or replaced by the phrases that do.
 POSITIVE_TERMS = {
     "accelerates",
     "acquisition",
@@ -25,44 +29,75 @@ POSITIVE_TERMS = {
     "guidance raised",
     "launch",
     "partnership",
-    "profit",
+    "raises guidance",
     "raises",
     "record",
     "secures",
     "upgrade",
+    "upgraded",
 }
 
 NEGATIVE_TERMS = {
     "bankruptcy",
     "charges",
-    "cut",
+    "cuts guidance",
+    "cut guidance",
+    "cuts forecast",
+    "lowers guidance",
     "downgrade",
+    "downgraded",
     "fraud",
     "guidance cut",
     "investigation",
     "lawsuit",
-    "miss",
+    "missed",
     "misses",
     "probe",
     "recall",
     "sanction",
+    "sanctions",
     "slumps",
     "warning",
 }
 
-RUMOR_TERMS = {"could", "reportedly", "rumor", "speculation", "talks", "unconfirmed"}
+RUMOR_TERMS = {
+    "in talks",
+    "people familiar",
+    "reportedly",
+    "rumor",
+    "rumors",
+    "rumored",
+    "sources said",
+    "sources say",
+    "speculation",
+    "unconfirmed",
+}
 MACRO_TERMS = {
     "cpi",
     "fed",
+    "federal reserve",
     "inflation",
-    "jobs",
-    "president",
-    "rate",
+    "interest rate",
+    "interest rates",
+    "jobs report",
+    "payrolls",
+    "rate cut",
+    "rate cuts",
+    "rate hike",
+    "rate hikes",
     "tariff",
-    "treasury",
+    "tariffs",
+    "treasury yields",
 }
-GEOPOLITICAL_TERMS = {"china", "iran", "israel", "russia", "sanction", "ukraine", "war"}
+GEOPOLITICAL_TERMS = {"china", "iran", "israel", "russia", "sanction", "sanctions", "ukraine", "war"}
 OFFICIAL_TERMS = {"10-k", "10-q", "8-k", "announces", "company", "filing", "results"}
+# Narrower than OFFICIAL_TERMS: words like "company"/"results" appear in almost
+# every article, so they cannot confirm a rumor.
+CONFIRMATION_TERMS = {"10-k", "10-q", "8-k", "announced", "announces", "confirmed", "confirms", "press release"}
+# A single macro word in a stock's headlines is background noise, not an event
+# specific to that stock; only flag event risk when several distinct macro or
+# geopolitical terms co-occur.
+MACRO_EVENT_MIN_DISTINCT_TERMS = 3
 
 
 @dataclass
@@ -307,7 +342,9 @@ class CatalystEngine:
             evidence.append(f"{positive} positive catalyst keyword(s) found in headlines.")
         if negative:
             risks.append(f"{negative} negative catalyst keyword(s) found in headlines.")
-        if rumor:
+        confirmed = self._term_hits(text, CONFIRMATION_TERMS)
+        if rumor and not confirmed:
+            # Rumor language with no official/company confirmation.
             risks.append("rumor_only_catalyst")
         if macro or geo:
             risks.append("macro_or_geopolitical_headline_risk")
@@ -434,8 +471,9 @@ class CatalystEngine:
             evidence.append("Upcoming/recent earnings language is present in headlines.")
             score -= min(earnings_hits * 4, 10)
         if macro_hits:
-            risks.append("event_risk_macro_or_geopolitical")
             score -= min(macro_hits * 6, 24)
+        if macro_hits >= MACRO_EVENT_MIN_DISTINCT_TERMS:
+            risks.append("event_risk_macro_or_geopolitical")
         vol20 = float(market_layer.metadata.get("vol20") or 0)
         if vol20 > self.settings.catalyst.max_volatility_pct:
             risks.append("event_risk_high_volatility")
@@ -520,7 +558,7 @@ class CatalystEngine:
         )
 
     def _term_hits(self, text: str, terms: set[str]) -> int:
-        return sum(1 for term in terms if term in text)
+        return count_terms(text, terms)
 
     def _news_text(self, research: ResearchSnapshot) -> str:
         parts: list[str] = []

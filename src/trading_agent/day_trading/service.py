@@ -5,14 +5,20 @@ from zoneinfo import ZoneInfo
 
 from trading_agent.catalyst.models import CatalystPrediction
 from trading_agent.config import Settings
-from trading_agent.indicators import pct_change, sma
+from trading_agent.indicators import sma
 from trading_agent.models import AssetClass, MarketSnapshot, OrderSide, Position, ResearchSnapshot, TradeCandidate
+from trading_agent.text_terms import matched_terms
+
+NEWS_RISK_TERMS = ("downgrade", "downgraded", "fraud", "investigation", "lawsuit", "misses", "missed", "recall", "warning")
 
 
 class DayTradingEngine:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._peak_pnl: dict[str, float] = {}
+        # Today's actual session close from the broker clock (handles early
+        # closes); falls back to 16:00 ET when unknown.
+        self.market_close: datetime | None = None
 
     def enabled(self) -> bool:
         if not self.settings.day_trading.enabled:
@@ -29,6 +35,7 @@ class DayTradingEngine:
         positions: list[Position],
         *,
         trades_used_today: int = 0,
+        now: datetime | None = None,
     ) -> tuple[TradeCandidate | None, dict]:
         signal = self._base_signal(market, research, prediction)
         signal["kind"] = "entry"
@@ -59,6 +66,14 @@ class DayTradingEngine:
         execution_reason = self._execution_block_reason(market)
         if execution_reason:
             signal.update({"status": "blocked", "reason": execution_reason})
+            return None, signal
+        cutoff = self.settings.day_trading.last_entry_minutes_before_close
+        minutes_left = self._minutes_to_close(now)
+        if cutoff and minutes_left is not None and minutes_left < cutoff:
+            signal.update({
+                "status": "blocked",
+                "reason": f"Too late for a new day trade: {minutes_left:.0f} minutes to the close (cutoff {cutoff}).",
+            })
             return None, signal
 
         cfg = self.settings.day_trading
@@ -271,9 +286,8 @@ class DayTradingEngine:
                 score -= 8
                 risks.append(f"Relative volume is only {relative_volume:.2f}x.")
 
+        # No fallback to daily closes: a 5-day change is not a short-term trend.
         minute_trend = self._float(metadata.get("minute_trend_pct"))
-        if minute_trend is None:
-            minute_trend = pct_change(closes, min(5, max(len(closes) - 1, 1))) if len(closes) >= 6 else None
         if minute_trend is not None:
             score += max(-18, min(18, minute_trend * 4))
             if minute_trend > 0:
@@ -386,7 +400,7 @@ class DayTradingEngine:
                 f"Profit reversal: peaked at +{peak_pnl_pct:.2f}% but now {pnl_pct:.2f}%.",
                 92,
             )
-        if intraday_score <= cfg.exit_intraday_score:
+        if cfg.intraday_score_exit_enabled and intraday_score <= cfg.exit_intraday_score:
             return "Intraday trend score fell below exit threshold.", 88
         if (
             held_minutes is not None
@@ -417,9 +431,8 @@ class DayTradingEngine:
         return None, 0
 
     def _news_risks(self, research: ResearchSnapshot) -> list[str]:
-        negative_terms = ("downgrade", "fraud", "investigation", "lawsuit", "miss", "recall", "warning")
         text = " ".join(f"{item.title} {item.summary or ''}".lower() for item in research.news)
-        return [f"negative_news:{term}" for term in negative_terms if term in text]
+        return [f"negative_news:{term}" for term in matched_terms(text, NEWS_RISK_TERMS)]
 
     def _spread_pct(self, market: MarketSnapshot) -> float | None:
         metadata = market.metadata or {}
@@ -447,15 +460,33 @@ class DayTradingEngine:
             current = current.replace(tzinfo=UTC)
         return max(int((current.astimezone(UTC) - started.astimezone(UTC)).total_seconds() // 60), 0)
 
+    def _session_close(self, now: datetime) -> datetime | None:
+        eastern = now.astimezone(ZoneInfo("America/New_York"))
+        if self.market_close is not None:
+            close = self.market_close.astimezone(ZoneInfo("America/New_York"))
+            if close.date() == eastern.date():
+                return close
+        if eastern.weekday() >= 5:
+            return None
+        return datetime.combine(eastern.date(), time(16, 0), tzinfo=eastern.tzinfo)
+
+    def _minutes_to_close(self, now: datetime | None) -> float | None:
+        current = now or datetime.now(UTC)
+        close = self._session_close(current)
+        if close is None:
+            return None
+        return (close - current.astimezone(close.tzinfo)).total_seconds() / 60
+
     def _force_exit_window(self, *, now: datetime | None) -> bool:
         minutes = self.settings.day_trading.force_exit_before_close_minutes
         if minutes <= 0:
             return False
-        local_now = (now or datetime.now(UTC)).astimezone(ZoneInfo("America/Chicago"))
-        if local_now.weekday() >= 5:
+        current = now or datetime.now(UTC)
+        close = self._session_close(current)
+        if close is None:
             return False
-        close_time = datetime.combine(local_now.date(), time(15, 0), tzinfo=local_now.tzinfo)
-        return close_time - timedelta(minutes=minutes) <= local_now <= close_time + timedelta(minutes=30)
+        local_now = current.astimezone(close.tzinfo)
+        return close - timedelta(minutes=minutes) <= local_now <= close + timedelta(minutes=30)
 
     def _position_for(self, symbol: str, positions: list[Position]) -> Position | None:
         for position in positions:

@@ -147,6 +147,13 @@ class TradingAgent:
             except Exception:
                 _clock = None
             market_open = bool(_clock and _clock.get("is_open"))
+            if _clock and _clock.get("next_close") and getattr(self, "day_trading", None):
+                try:
+                    self.day_trading.market_close = datetime.fromisoformat(
+                        str(_clock["next_close"]).replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    pass
 
             if self.settings.execution.market_hours_only_options:
                 if _clock is None:
@@ -193,6 +200,11 @@ class TradingAgent:
                     options_window_ok=options_window_ok,
                 )
                 entry_candidates = self._apply_halt_filter(generated, swing_halt, day_trade_halt)
+                swing_window_ok, swing_window_info = self._evaluate_swing_entry_window(_clock, datetime.now(UTC))
+                if not swing_window_ok:
+                    entry_candidates = self._drop_swing_equity_entries(
+                        entry_candidates, cycle_id, swing_window_info.get("note", "")
+                    )
                 for candidate in entry_candidates:
                     if candidate.metadata.get("day_trade"):
                         candidate.metadata["day_trade_daily_pl_pct"] = day_trade_pl_pct
@@ -209,6 +221,16 @@ class TradingAgent:
                     market_open=market_open,
                 )
                 await self._sync_recent_order_updates(cycle_id)
+                exiting_symbols = {
+                    decision.intent.symbol
+                    for decision in decisions
+                    if decision.approved and decision.intent and decision.candidate.metadata.get("exit")
+                }
+                await self._reconcile_swing_protection(
+                    positions,
+                    cycle_id,
+                    skip_symbols=day_trade_symbols | exiting_symbols,
+                )
             if self.audit and cycle_id:
                 self.audit.finish_cycle(
                     cycle_id, status="stopped" if (swing_halt or day_trade_halt) else "completed"
@@ -283,6 +305,178 @@ class TradingAgent:
         )
         realized = self.audit.day_trade_realized_pl_since(start_of_trading_day()) if self.audit else 0.0
         return (open_pl + realized) / account.equity * 100
+
+    def _evaluate_swing_entry_window(self, clock: dict | None, now: datetime) -> tuple[bool, dict]:
+        window = self.settings.strategy.swing_entry_window_minutes
+        if window <= 0:
+            return True, {"note": "Swing entry window disabled; entries allowed while the market is open."}
+        if not clock or not clock.get("is_open") or not clock.get("next_close"):
+            return False, {"note": "Swing entries wait for the pre-close window (market closed or clock unavailable)."}
+        try:
+            close_dt = datetime.fromisoformat(str(clock["next_close"]).replace("Z", "+00:00"))
+        except ValueError:
+            return False, {"note": "Swing entry window: unparseable market close time."}
+        minutes_to_close = (close_dt - now.astimezone(UTC)).total_seconds() / 60
+        buffer = self.settings.execution.close_buffer_minutes
+        if minutes_to_close > window:
+            return False, {
+                "note": f"Swing entries wait for the last {window} minutes before the close "
+                f"({minutes_to_close:.0f} minutes to go)."
+            }
+        if minutes_to_close < buffer:
+            return False, {"note": f"Swing entries blocked within {buffer} minutes of the close."}
+        return True, {"note": f"Swing entry window open ({minutes_to_close:.0f} minutes to the close)."}
+
+    def _drop_swing_equity_entries(
+        self, candidates: list[TradeCandidate], cycle_id: int | None, note: str,
+    ) -> list[TradeCandidate]:
+        kept: list[TradeCandidate] = []
+        for candidate in candidates:
+            is_swing_equity_entry = (
+                not candidate.metadata.get("day_trade")
+                and not candidate.metadata.get("exit")
+                and candidate.asset_class in {AssetClass.EQUITY, AssetClass.ETF}
+            )
+            if is_swing_equity_entry:
+                self._audit_candidate(cycle_id, candidate, status="deferred", reason=note)
+                continue
+            kept.append(candidate)
+        return kept
+
+    async def _reconcile_swing_protection(
+        self,
+        positions: list[Position],
+        cycle_id: int | None,
+        *,
+        skip_symbols: set[str],
+    ) -> None:
+        """Keep exactly one resting GTC stop under every swing equity long.
+
+        Entries are plain DAY limit orders, so nothing protects a fresh fill
+        until this runs. (Swing entries used to be DAY brackets whose stop leg was
+        cancelled at the close, leaving every position unguarded overnight.) The
+        stop follows the position manager's ratcheting level and is only ever
+        replaced upward.
+        """
+        swing_longs = [
+            position
+            for position in positions
+            if position.asset_class in {AssetClass.EQUITY, AssetClass.ETF}
+            and position.qty >= 1
+            and position.symbol not in skip_symbols
+        ]
+        if not swing_longs:
+            return
+        try:
+            open_orders = await self.broker.get_open_orders()
+        except Exception as exc:
+            self.console.print(f"[yellow]protection check skipped[/yellow] open orders unavailable: {exc}")
+            return
+        pm_cfg = self.settings.position_manager
+        for position in swing_longs:
+            symbol = position.symbol
+            qty = int(position.qty)
+            current_price = position.current_price or position.avg_entry_price
+            if not current_price or not position.avg_entry_price:
+                continue
+            swing_stop = self.position_manager.swing_stop(position)
+            if swing_stop is not None:
+                target, basis, atr_value = swing_stop.level, swing_stop.basis, swing_stop.atr
+            else:
+                target = position.avg_entry_price * (1 - pm_cfg.stop_loss_pct / 100)
+                basis, atr_value = "percent_stop", None
+            if current_price <= target * 1.002:
+                # At/through the stop: the position manager exits it this cycle
+                # or next; a sell stop above the market would trigger instantly.
+                continue
+            sells = [
+                order for order in open_orders
+                if str(order.get("symbol") or "") == symbol and str(order.get("side") or "") == "sell"
+            ]
+            stops = [
+                order for order in sells
+                if str(order.get("type") or order.get("order_type") or "").lower() in {"stop", "stop_limit"}
+            ]
+            if len(sells) > len(stops):
+                # A non-stop sell (bracket take-profit leg or a working exit)
+                # already reserves these shares; don't fight it.
+                continue
+            if not stops:
+                await self._place_swing_stop(symbol, qty, target, basis, cycle_id)
+                continue
+            resting = max(stops, key=lambda order: self._coerce_float(order.get("stop_price")) or 0)
+            resting_stop = self._coerce_float(resting.get("stop_price")) or 0.0
+            resting_qty = int(self._coerce_float(resting.get("qty")) or 0)
+            tolerance = max((atr_value or 0) * pm_cfg.stop_ratchet_min_atr, current_price * 0.0005)
+            needs_raise = target > resting_stop + tolerance
+            if not needs_raise and resting_qty == qty:
+                continue
+            new_stop = max(target, resting_stop)
+            try:
+                replaced = await self.broker.replace_order(
+                    str(resting.get("id")),
+                    qty=qty if resting_qty != qty else None,
+                    stop_price=new_stop if needs_raise else None,
+                )
+            except Exception as exc:
+                if "cannot replace" in str(exc).lower():
+                    # Orders sit in "accepted" while the market is closed and the
+                    # broker refuses to replace them then; cancel and re-place.
+                    await self._cancel_and_replace_stop(resting, symbol, qty, new_stop, basis, cycle_id)
+                    continue
+                self.console.print(f"[yellow]stop not raised[/yellow] {symbol}: {exc}")
+                self._audit_event(
+                    cycle_id, "order", {"order_id": resting.get("id"), "target_stop": new_stop, "error": str(exc)},
+                    symbol=symbol, strategy="swing_protective_stop", status="replace_failed",
+                    reason=f"Could not move the resting stop to {new_stop:.2f}: {exc}",
+                )
+                continue
+            self._audit_event(
+                cycle_id, "order",
+                {"previous_order": resting, "broker_order": replaced, "target_stop": new_stop, "basis": basis},
+                symbol=symbol, strategy="swing_protective_stop", status="replaced",
+                reason=f"Raised resting stop {resting_stop:.2f} -> {new_stop:.2f} ({basis.replace('_', ' ')}).",
+            )
+            self.console.print(f"[green]stop raised[/green] {symbol} {resting_stop:.2f} -> {new_stop:.2f}")
+
+    async def _cancel_and_replace_stop(
+        self, resting: dict, symbol: str, qty: int, new_stop: float, basis: str, cycle_id: int | None,
+    ) -> None:
+        resting_stop = self._coerce_float(resting.get("stop_price")) or 0.0
+        try:
+            await self.broker.cancel_order(str(resting.get("id")))
+        except Exception as exc:
+            self.console.print(f"[yellow]stop not raised[/yellow] {symbol}: cancel failed: {exc}")
+            return
+        await asyncio.sleep(_EXIT_RETRY_DELAY_SECONDS)
+        placed = await self._place_swing_stop(symbol, qty, new_stop, basis, cycle_id)
+        if not placed and resting_stop > 0:
+            # Never leave the position bare: put the previous stop back.
+            await self._place_swing_stop(symbol, qty, resting_stop, "restored_previous_stop", cycle_id)
+
+    async def _place_swing_stop(
+        self, symbol: str, qty: int, stop_price: float, basis: str, cycle_id: int | None,
+    ) -> bool:
+        intent = self._equity_protection_intent(symbol, qty, stop_price, None)
+        if intent is None:
+            return False
+        try:
+            order = await self.broker.submit_order(intent)
+        except Exception as exc:
+            self.console.print(f"[red]swing stop not placed[/red] {symbol}: {exc}")
+            self._audit_event(
+                cycle_id, "order", {"intent": intent, "error": str(exc)},
+                symbol=symbol, strategy="swing_protective_stop", status="unprotected",
+                reason=f"Could not place the GTC protective stop at {stop_price:.2f}: {exc}",
+            )
+            return False
+        self._audit_event(
+            cycle_id, "order", {"intent": intent, "broker_order": order},
+            symbol=symbol, strategy="swing_protective_stop", status="submitted",
+            reason=f"Placed GTC protective stop at {stop_price:.2f} ({basis.replace('_', ' ')}).",
+        )
+        self.console.print(f"[green]swing stop placed[/green] {symbol} @ {stop_price:.2f}")
+        return True
 
     def _apply_halt_filter(
         self,
@@ -433,7 +627,10 @@ class TradingAgent:
                     day_trade_signal = {
                         **day_trade_signal,
                         "status": "blocked",
-                        "reason": "Swing candidate exists for this symbol in the same cycle; preferring swing trade.",
+                        "reason": (
+                            "Swing candidate exists for this symbol; day trade yields so it cannot block "
+                            "the swing entry (a day-trade entry blocks swing on that symbol for the day)."
+                        ),
                     }
                 if self.settings.day_trading.enabled:
                     self._audit_event(
@@ -612,6 +809,7 @@ class TradingAgent:
                         for item in screened
                     ],
                     "fallback_symbols": self.settings.strategy.symbols,
+                    "errors": list(getattr(self.screener, "last_errors", []) or []),
                 },
                 status="captured",
             )

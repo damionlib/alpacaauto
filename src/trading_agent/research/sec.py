@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 import httpx
+
+
+# Company facts change at most when a filing lands; refetching the multi-MB
+# XBRL document every 5-minute cycle per symbol was pure waste.
+SUMMARY_TTL_SECONDS = 12 * 60 * 60
 
 
 class SecClient:
@@ -11,6 +17,7 @@ class SecClient:
         self.headers = {"User-Agent": user_agent, "Accept-Encoding": "gzip, deflate"}
         self._ticker_map: dict[str, dict[str, Any]] | None = None
         self._ticker_map_lock = asyncio.Lock()
+        self._summary_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     async def _get_ticker_map(self) -> dict[str, dict[str, Any]]:
         # Load the ~1 MB ticker file asynchronously and cache it for the process.
@@ -36,6 +43,15 @@ class SecClient:
         return f"{int(row['cik_str']):010d}"
 
     async def get_company_summary(self, symbol: str) -> dict[str, Any]:
+        key = symbol.upper()
+        cached = self._summary_cache.get(key)
+        if cached and time.monotonic() - cached[0] < SUMMARY_TTL_SECONDS:
+            return cached[1]
+        summary = await self._fetch_company_summary(symbol)
+        self._summary_cache[key] = (time.monotonic(), summary)
+        return summary
+
+    async def _fetch_company_summary(self, symbol: str) -> dict[str, Any]:
         cik = await self.get_cik(symbol)
         if not cik:
             return {}
