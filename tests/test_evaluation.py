@@ -42,6 +42,13 @@ def test_invariants_flag_missing_stop_and_overnight_day_trade() -> None:
     assert invariant_violations([_position("AAA", 10)], full, set(), after_close=True) == []
 
 
+def test_open_day_trade_during_session_needs_no_gtc_stop() -> None:
+    # Intraday report: a day-trade position without a GTC stop is expected, not a violation.
+    assert invariant_violations([_position("DT", 31)], [], {"DT"}, after_close=False) == []
+    # A swing position without a stop is still flagged mid-session.
+    assert invariant_violations([_position("AAA", 10)], [], {"DT"}, after_close=False)
+
+
 def test_cross_book_conflict_is_reported() -> None:
     from trading_agent.evaluation import cross_book_conflicts
 
@@ -54,3 +61,18 @@ def test_cross_book_conflict_is_reported() -> None:
     assert cross_book_conflicts(round_trips(orders)) == [
         "AAA: entered by both the swing and day-trade books on 2026-11-05."
     ]
+
+
+def test_spy_changes_use_the_report_day_not_the_latest_bar() -> None:
+    from datetime import date
+
+    from trading_agent.evaluation import spy_changes
+
+    dates = ["2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06"]
+    closes = [754.35, 766.81, 733.0, 739.0]
+    day_change, since_change = spy_changes(closes, dates, day=date(2026, 11, 5), since=date(2026, 11, 5))
+    assert round(day_change, 2) == -4.41
+    assert round(since_change, 2) == -4.41
+    day_change, since_change = spy_changes(closes, dates, day=date(2026, 11, 6), since=date(2026, 11, 5))
+    assert round(day_change, 2) == 0.82
+    assert round(since_change, 2) == -3.63

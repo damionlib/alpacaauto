@@ -55,6 +55,11 @@ Backtest expectations to compare against:
 
 ## Changing the schedule
 
-- Session runner: `~/Library/LaunchAgents/com.local.trading-agent.session.plist`
+- Session runner: the "Paper trading session start" scheduled task in the Claude
+  app (weekdays ~08:27 CT) launches `scripts/run_session.sh` detached.
+  The launchd agent `~/Library/LaunchAgents/com.local.trading-agent.session.plist`
+  is blocked by macOS privacy protection ("Operation not permitted" on
+  `~/Documents`) unless `/bin/bash` is granted Full Disk Access; the runner's
+  duplicate-loop guard makes running both safe
   (remove: `launchctl bootout gui/$(id -u)/com.local.trading-agent.session`).
 - Daily review: the "Paper trading daily review" scheduled task in the Claude app.

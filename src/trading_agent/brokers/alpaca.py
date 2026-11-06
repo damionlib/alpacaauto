@@ -496,8 +496,9 @@ class AlpacaBroker:
         return {symbol: (bars["closes"], bars["volumes"]) for symbol, bars in series.items()}
 
     @staticmethod
-    def _bars_to_series(rows: list[dict]) -> dict[str, list[float]]:
+    def _bars_to_series(rows: list[dict]) -> dict[str, list]:
         return {
+            "dates": [str(bar.get("t") or "")[:10] for bar in rows],
             "opens": [float(bar["o"]) for bar in rows],
             "highs": [float(bar["h"]) for bar in rows],
             "lows": [float(bar["l"]) for bar in rows],

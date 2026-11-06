@@ -121,8 +121,11 @@ def invariant_violations(
         symbol, qty = position.symbol, float(position.qty)
         if getattr(position.asset_class, "value", position.asset_class) not in {"equity", "etf"} or qty <= 0:
             continue
-        if after_close and symbol in day_trade_symbols:
-            problems.append(f"{symbol}: day-trade position still open after the close ({qty:g} shares).")
+        if symbol in day_trade_symbols:
+            # Day trades are managed intraday by the loop (floor/ceiling/force-close),
+            # not by a resting GTC stop; the only invariant is flat by the close.
+            if after_close:
+                problems.append(f"{symbol}: day-trade position still open after the close ({qty:g} shares).")
             continue
         stops = [
             order for order in open_orders
@@ -220,6 +223,7 @@ def render_report(
     violations: list[str],
     funnel: dict[str, Any],
     positions: list[Any],
+    live_checks: bool = True,
 ) -> str:
     today = [trip for trip in trips if trip.exit_at.astimezone(EASTERN).date() == day]
     header = ["Book", "Trades", "P/L", "Win", "PF", "Expectancy", "Avg win / loss", "Max DD", "t-stat"]
@@ -235,7 +239,12 @@ def render_report(
         spy_text = f" vs SPY {spy_change_since_pct:+.2f}%" if spy_change_since_pct is not None else ""
         out.append(f"**Since {since.isoformat()}** {since_pct:+.2f}%{spy_text}")
     out += ["", "## Safety invariants", ""]
-    out += [f"- VIOLATION: {problem}" for problem in violations] or ["- All checks passed: no day trade held past the close; every swing position has a full-size GTC stop."]
+    out += [f"- VIOLATION: {problem}" for problem in violations]
+    if not live_checks:
+        out.append("- Stop coverage and overnight day trades are only checked when the report runs on the day "
+                   "itself; this report was generated later, from that day's last recorded cycle.")
+    elif not violations:
+        out.append("- All checks passed: no day trade held past the close; every swing position has a full-size GTC stop.")
     out += ["", "## Today", ""]
     out.append(_table([_stats_row(book, book_stats([t for t in today if t.book == book])) for book in ("day", "swing")], header))
     out += ["", f"## Since {since.isoformat()} (cumulative)", ""]
@@ -278,31 +287,42 @@ def render_report(
     return "\n".join(out) + "\n"
 
 
+def spy_changes(
+    closes: list[float], dates: list[str], *, day: date, since: date
+) -> tuple[float | None, float | None]:
+    """SPY % change on `day` and from the close before `since` through `day`."""
+    if dates and len(dates) == len(closes):
+        bars = [(d, c) for d, c in zip(dates, closes) if d <= day.isoformat()]
+    else:
+        bars = [("", c) for c in closes]
+    if len(bars) < 2:
+        return None, None
+    day_change = (bars[-1][1] / bars[-2][1] - 1) * 100
+    before = [c for d, c in bars if d and d < since.isoformat()]
+    since_change = (bars[-1][1] / before[-1] - 1) * 100 if before else None
+    return day_change, since_change
+
+
 async def build_daily_report(settings: Any, *, day: date | None = None, since: date | None = None) -> tuple[str, dict]:
     from trading_agent.audit import AuditStore, start_of_trading_day
     from trading_agent.brokers.alpaca import AlpacaBroker
+
+    from trading_agent.models import AccountSnapshot, Position
 
     broker = AlpacaBroker(settings)
     now = datetime.now(UTC)
     day = day or now.astimezone(EASTERN).date()
     since = since or day
-    account = await broker.get_account()
-    positions = await broker.get_positions()
-    open_orders = await broker.get_open_orders()
+    # A report for an earlier day cannot use live broker state: positions, stops
+    # and equity have moved on. It uses that day's last recorded cycle instead.
+    historical = day < now.astimezone(EASTERN).date()
     after = datetime.combine(since, time(0, 0), tzinfo=EASTERN).astimezone(UTC).isoformat()
     until = datetime.combine(day + timedelta(days=1), time(0, 0), tzinfo=EASTERN).astimezone(UTC).isoformat()
     closed = await broker.get_recent_orders(status="closed", limit=500, after=after, until=until)
     trips = round_trips(closed)
-    audit = AuditStore(settings.audit.database_path)
-    day_trade_symbols = {
-        str(event.get("symbol") or "") for event in audit.day_trade_entries_since(start_of_trading_day())
-    }
-    clock = await broker.get_clock()
-    after_close = not clock.get("is_open") and now.astimezone(EASTERN).time() >= time(16, 0)
-    violations = invariant_violations(positions, open_orders, day_trade_symbols, after_close=after_close)
-    violations += cross_book_conflicts(trips)
 
     start_equity = None
+    last_cycle = None
     connection = sqlite3.connect(f"file:{settings.audit.database_path}?mode=ro", uri=True)
     try:
         row = connection.execute(
@@ -310,22 +330,38 @@ async def build_daily_report(settings: Any, *, day: date | None = None, since: d
         ).fetchone()
         if row and row[0]:
             start_equity = float(json.loads(row[0]).get("equity") or 0) or None
+        last_cycle = connection.execute(
+            "select account_json, positions_json from cycles where started_at < ? and account_json is not null "
+            "order by id desc limit 1", (until,)
+        ).fetchone()
     finally:
         connection.close()
-    spy = (await broker.get_daily_bars(["SPY"], lookback_days=max((day - since).days + 10, 15))).get("SPY") or {}
-    spy_day = spy_since = None
-    closes = spy.get("closes") or []
-    if len(closes) >= 2:
-        spy_day = (closes[-1] / closes[-2] - 1) * 100
-        sessions = max(1, sum(1 for offset in range((day - since).days + 1)
-                              if (since + timedelta(days=offset)).weekday() < 5))
-        if len(closes) > sessions:
-            spy_since = (closes[-1] / closes[-1 - sessions] - 1) * 100
+
+    if historical and last_cycle:
+        account = AccountSnapshot(**json.loads(last_cycle[0]))
+        positions = [Position(**item) for item in json.loads(last_cycle[1] or "[]")]
+        violations = []
+    else:
+        account = await broker.get_account()
+        positions = await broker.get_positions()
+        open_orders = await broker.get_open_orders()
+        audit = AuditStore(settings.audit.database_path)
+        day_trade_symbols = {
+            str(event.get("symbol") or "") for event in audit.day_trade_entries_since(start_of_trading_day())
+        }
+        clock = await broker.get_clock()
+        after_close = not clock.get("is_open") and now.astimezone(EASTERN).time() >= time(16, 0)
+        violations = invariant_violations(positions, open_orders, day_trade_symbols, after_close=after_close)
+    violations += cross_book_conflicts(trips)
+
+    spy = (await broker.get_daily_bars(["SPY"], lookback_days=max((now.date() - since).days + 10, 15))).get("SPY") or {}
+    spy_day, spy_since = spy_changes(spy.get("closes") or [], spy.get("dates") or [], day=day, since=since)
     funnel = audit_funnel(settings.audit.database_path, day)
     report = render_report(
         day=day, since=since, account=account, start_equity=start_equity,
         spy_change_since_pct=spy_since, spy_change_day_pct=spy_day, trips=trips,
         violations=violations, funnel=funnel, positions=positions,
+        live_checks=not historical,
     )
     summary = {
         "date": day.isoformat(),
